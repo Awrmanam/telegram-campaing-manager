@@ -1,0 +1,14 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    init: true
+    volumes:
+      - database:/data/database
+      - sessions:/data/sessions
+      - media:/data/media
+volumes:
+  database:
+  sessions:
+  media:

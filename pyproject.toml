@@ -1,0 +1,24 @@
+[project]
+name = "telegram-campaign-manager"
+version = "1.0.0"
+description = "Allowlist-only Telegram campaign manager"
+requires-python = ">=3.12"
+dependencies = ["aiogram>=3.13,<4", "telethon>=1.36,<2", "SQLAlchemy[asyncio]>=2.0,<3", "aiosqlite>=0.20", "APScheduler>=3.10,<4", "pydantic-settings>=2.4"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.6"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
