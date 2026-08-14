@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import random
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
@@ -15,9 +16,15 @@ from telethon.errors import (
 )
 
 from app.campaigns.rotation import select_message
-from app.campaigns.service import calculate_next_run
+from app.campaigns.service import (
+    CampaignValidationError,
+    calculate_next_run,
+    validate_campaign_ready,
+)
 from app.database.models import Campaign, DeliveryLog, DeliveryStatus, MessageType, SenderAccount
 from app.telegram.client_manager import ClientManager
+
+logger = logging.getLogger(__name__)
 
 
 class DeliveryService:
@@ -56,26 +63,57 @@ class DeliveryService:
             return False
         async with self.sessions() as session:
             campaign = await session.scalar(select(Campaign).where(Campaign.id == campaign_id))
+            try:
+                await validate_campaign_ready(session, campaign)
+            except CampaignValidationError as exc:
+                logger.warning("campaign_not_ready campaign_id=%s reason=%s", campaign_id, exc)
+                campaign.execution_token = campaign.execution_started_at = None
+                campaign.failure_count += 1
+                await session.commit()
+                if self.alerts:
+                    await self.alerts.send(f"campaign:{campaign_id}:not_ready", str(exc))
+                return False
             await session.refresh(campaign, ["messages", "targets"])
             account = await session.get(SenderAccount, campaign.sender_account_id)
-            if not account or not account.enabled:
-                await self._finish(session, campaign, token, failed=True, manual=manual)
+            now = datetime.now(timezone.utc)
+            if manual and campaign.manual_retry_at:
+                retry_at = campaign.manual_retry_at
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                if retry_at > now:
+                    campaign.execution_token = campaign.execution_started_at = None
+                    await session.commit()
+                    return False
+            if not account:
+                campaign.execution_token = campaign.execution_started_at = None
+                await session.commit()
                 return False
             message, next_index = select_message(campaign.messages, campaign.rotation_index)
             targets = [
                 t for t in campaign.targets if t.enabled and t.sender_account_id == account.id
             ]
             targets.sort(key=lambda target: target.id)
-            cursor = min(campaign.delivery_cursor, len(targets))
+            stored_cursor = campaign.manual_delivery_cursor if manual else campaign.delivery_cursor
+            cursor = min(stored_cursor, len(targets))
             try:
                 client = await self.clients.get(account)
-            except Exception as exc:
+            except (PermissionError, OSError, RPCError) as exc:
                 if self.alerts:
                     await self.alerts.send(
                         f"sender:{account.id}:connection",
                         f"اتصال حساب {account.label} برای کمپین {campaign.name} برقرار نشد ({type(exc).__name__}).",
                     )
                 await self._finish(session, campaign, token, failed=True, manual=manual)
+                return False
+            except Exception as exc:
+                logger.exception("unexpected_sender_connection_error campaign_id=%s", campaign_id)
+                if self.alerts:
+                    await self.alerts.send(
+                        f"sender:{account.id}:unexpected_connection",
+                        f"خطای پیش‌بینی‌نشده اتصال حساب {account.label}: {type(exc).__name__}",
+                    )
+                campaign.execution_token = campaign.execution_started_at = None
+                await session.commit()
                 return False
             had_failure = False
             rate_limited_until = None
@@ -112,7 +150,10 @@ class DeliveryService:
                     )
                     had_failure = True
                     rate_limited_until = datetime.now(timezone.utc) + timedelta(seconds=exc.seconds)
-                    campaign.delivery_cursor = position
+                    if manual:
+                        campaign.manual_delivery_cursor = position
+                    else:
+                        campaign.delivery_cursor = position
                     log.completed_at = datetime.now(timezone.utc)
                     await session.commit()
                     if self.alerts:
@@ -140,7 +181,10 @@ class DeliveryService:
             # A rate-limited run is incomplete: retain the message and schedule one clear retry.
             # Successful/ordinary-failure runs advance normally and never retry forever.
             if rate_limited_until:
-                campaign.next_run_at = rate_limited_until
+                if manual:
+                    campaign.manual_retry_at = rate_limited_until
+                else:
+                    campaign.next_run_at = rate_limited_until
                 campaign.execution_token = campaign.execution_started_at = None
                 campaign.failure_count += 1
                 await session.commit()
@@ -151,7 +195,11 @@ class DeliveryService:
                     f"یک یا چند ارسال کمپین {campaign.name} ناموفق بود. گزارش تحویل را بررسی کنید.",
                 )
             campaign.rotation_index = next_index
-            campaign.delivery_cursor = 0
+            if manual:
+                campaign.manual_delivery_cursor = 0
+                campaign.manual_retry_at = None
+            else:
+                campaign.delivery_cursor = 0
             await self._finish(session, campaign, token, failed=had_failure, manual=manual)
             return True
 

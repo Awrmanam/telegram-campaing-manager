@@ -1,12 +1,24 @@
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.bot.middlewares import is_admin
 from app.bot.handlers import build_router
 from app.campaigns.rotation import select_message
-from app.campaigns.service import calculate_next_run, parse_interval, validate_targets
+from app.campaigns.service import (
+    CampaignValidationError,
+    activate_campaign,
+    calculate_next_run,
+    move_campaign_message,
+    normalize_message_positions,
+    parse_interval,
+    pause_if_no_enabled_targets,
+    validate_campaign_ready,
+    validate_targets,
+)
 from app.campaigns.scheduler import CampaignScheduler
 from app.database.models import (
     Base,
@@ -18,6 +30,8 @@ from app.database.models import (
 )
 from app.services.alert_service import AlertService
 from app.services.delivery_service import DeliveryService
+from app.services.media_service import replace_message_content
+from telethon.errors import FloodWaitError
 
 
 @pytest.fixture
@@ -137,6 +151,33 @@ class FakeClients:
         return Client()
 
 
+class FloodClients:
+    async def get(self, account):
+        class Client:
+            async def send_message(self, *args, **kwargs):
+                raise FloodWaitError(request=None, capture=60)
+
+        return Client()
+
+
+class SecondTargetFloodClients:
+    async def get(self, account):
+        class Client:
+            calls = 0
+
+            async def send_message(self, *args, **kwargs):
+                self.calls += 1
+                if self.calls == 2:
+                    raise FloodWaitError(request=None, capture=60)
+
+                class Sent:
+                    id = 42
+
+                return Sent()
+
+        return Client()
+
+
 @pytest.mark.asyncio
 async def test_disabled_sender_excluded(sessions):
     _, _, campaign_id = await seed(sessions, account_enabled=False)
@@ -149,8 +190,53 @@ async def test_disabled_sender_excluded(sessions):
 async def test_disabled_group_excluded(sessions):
     _, _, campaign_id = await seed(sessions, target_enabled=False)
     clients = FakeClients()
-    assert await DeliveryService(sessions, clients, 0, 0).execute(campaign_id)
-    assert clients.calls == 1
+    assert not await DeliveryService(sessions, clients, 0, 0).execute(campaign_id)
+    assert clients.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_zero_target_campaign_fails_without_rotation(sessions):
+    _, target_id, campaign_id = await seed(sessions)
+    async with sessions() as session:
+        campaign = await session.get(Campaign, campaign_id)
+        campaign.targets.clear()
+        await session.commit()
+    assert not await DeliveryService(sessions, FakeClients(), 0, 0).execute(campaign_id)
+    async with sessions() as session:
+        campaign = await session.get(Campaign, campaign_id)
+        assert campaign.rotation_index == 0
+
+
+@pytest.mark.asyncio
+async def test_campaign_ready_validation(sessions):
+    _, _, campaign_id = await seed(sessions, account_enabled=False)
+    async with sessions() as session:
+        campaign = await session.get(Campaign, campaign_id)
+        with pytest.raises(CampaignValidationError):
+            await validate_campaign_ready(session, campaign)
+
+
+@pytest.mark.asyncio
+async def test_campaign_start_validation_and_activation(sessions):
+    _, _, campaign_id = await seed(sessions, target_enabled=False)
+    async with sessions() as session:
+        campaign = await session.get(Campaign, campaign_id)
+        campaign.enabled = False
+        with pytest.raises(CampaignValidationError):
+            await activate_campaign(session, campaign)
+        assert not campaign.enabled and campaign.next_run_at is None
+
+
+@pytest.mark.asyncio
+async def test_final_target_removal_pauses_active_campaign(sessions):
+    _, _, campaign_id = await seed(sessions)
+    async with sessions() as session:
+        campaign = await session.get(Campaign, campaign_id)
+        await session.refresh(campaign, ["targets"])
+        campaign.targets.clear()
+        await session.flush()
+        assert await pause_if_no_enabled_targets(session, campaign)
+        assert not campaign.enabled
 
 
 @pytest.mark.asyncio
@@ -203,3 +289,152 @@ async def test_restart_scheduler_restores_future_job(sessions):
     job = scheduler.scheduler.get_job(f"campaign-{campaign_id}")
     assert job is not None
     assert abs((job.next_run_time - future).total_seconds()) < 1
+
+
+class DownloadBot:
+    async def download(self, _file_id, destination):
+        destination.write_bytes(b"new-photo")
+
+
+@pytest.mark.asyncio
+async def test_photo_to_text_clears_obsolete_media(tmp_path):
+    old = tmp_path / "old.jpg"
+    old.write_bytes(b"old")
+    message = CampaignMessage(
+        id=7,
+        campaign_id=1,
+        position=1,
+        message_type=MessageType.PHOTO,
+        text="caption",
+        media_path=str(old),
+    )
+    await replace_message_content(
+        message, {"message_type": "TEXT", "text": "text", "file_id": None}, DownloadBot(), tmp_path
+    )
+    assert message.message_type == MessageType.TEXT and message.media_path is None
+    assert not old.exists()
+
+
+@pytest.mark.asyncio
+async def test_text_to_photo_and_photo_replacement(tmp_path):
+    message = CampaignMessage(
+        id=8, campaign_id=1, position=1, message_type=MessageType.TEXT, text="text"
+    )
+    replacement = {"message_type": "PHOTO", "text": "caption", "file_id": "file"}
+    await replace_message_content(message, replacement, DownloadBot(), tmp_path)
+    assert message.message_type == MessageType.PHOTO
+    assert Path(message.media_path).read_bytes() == b"new-photo"
+    Path(message.media_path).write_bytes(b"stale")
+    await replace_message_content(message, replacement, DownloadBot(), tmp_path)
+    assert Path(message.media_path).read_bytes() == b"new-photo"
+
+
+@pytest.mark.asyncio
+async def test_message_positions_normalized_after_delete(sessions):
+    _, _, campaign_id = await seed(sessions)
+    async with sessions() as session:
+        session.add_all(
+            [
+                CampaignMessage(
+                    campaign_id=campaign_id, position=2, message_type=MessageType.TEXT, text="2"
+                ),
+                CampaignMessage(
+                    campaign_id=campaign_id, position=3, message_type=MessageType.TEXT, text="3"
+                ),
+            ]
+        )
+        await session.commit()
+        middle = await session.scalar(
+            select(CampaignMessage).where(
+                CampaignMessage.campaign_id == campaign_id, CampaignMessage.position == 2
+            )
+        )
+        await session.delete(middle)
+        await session.flush()
+        await normalize_message_positions(session, campaign_id)
+        await session.commit()
+        positions = list(
+            (
+                await session.scalars(
+                    select(CampaignMessage.position)
+                    .where(CampaignMessage.campaign_id == campaign_id)
+                    .order_by(CampaignMessage.position)
+                )
+            ).all()
+        )
+        assert positions == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_message_reorder_keeps_contiguous_positions(sessions):
+    _, _, campaign_id = await seed(sessions)
+    async with sessions() as session:
+        second = CampaignMessage(
+            campaign_id=campaign_id,
+            position=2,
+            message_type=MessageType.TEXT,
+            text="second",
+        )
+        session.add(second)
+        await session.commit()
+        assert await move_campaign_message(session, second, -1)
+        await session.commit()
+        messages = list(
+            (
+                await session.scalars(
+                    select(CampaignMessage)
+                    .where(CampaignMessage.campaign_id == campaign_id)
+                    .order_by(CampaignMessage.position)
+                )
+            ).all()
+        )
+        assert [message.position for message in messages] == [1, 2]
+        assert [message.text for message in messages] == ["second", "hello"]
+
+
+@pytest.mark.asyncio
+async def test_manual_flood_wait_preserves_recurring_schedule(sessions):
+    _, _, campaign_id = await seed(sessions)
+    recurring = datetime.now(timezone.utc) + timedelta(hours=2)
+    async with sessions() as session:
+        campaign = await session.get(Campaign, campaign_id)
+        campaign.next_run_at = recurring
+        await session.commit()
+    assert not await DeliveryService(sessions, FloodClients(), 0, 0).execute(
+        campaign_id, manual=True
+    )
+    async with sessions() as session:
+        campaign = await session.get(Campaign, campaign_id)
+        next_run = campaign.next_run_at.replace(tzinfo=timezone.utc)
+        assert next_run == recurring
+        assert campaign.manual_retry_at is not None
+        assert campaign.manual_delivery_cursor == 0
+        assert campaign.rotation_index == 0
+
+
+@pytest.mark.asyncio
+async def test_scheduled_flood_wait_retains_cursor_and_message(sessions):
+    account_id, _, campaign_id = await seed(sessions)
+    old_next = datetime.now(timezone.utc)
+    async with sessions() as session:
+        campaign = await session.get(Campaign, campaign_id)
+        second = TargetChat(
+            sender_account_id=account_id,
+            telegram_chat_id=-2,
+            title="T2",
+            chat_type="group",
+            enabled=True,
+        )
+        session.add(second)
+        campaign.targets.append(second)
+        campaign.next_run_at = old_next
+        await session.commit()
+    assert not await DeliveryService(sessions, SecondTargetFloodClients(), 0, 0).execute(
+        campaign_id
+    )
+    async with sessions() as session:
+        campaign = await session.get(Campaign, campaign_id)
+        next_run = campaign.next_run_at.replace(tzinfo=timezone.utc)
+        assert next_run > old_next
+        assert campaign.delivery_cursor == 1
+        assert campaign.rotation_index == 0

@@ -4,7 +4,93 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import Campaign, TargetChat
+from app.database.models import Campaign, CampaignMessage, SenderAccount, TargetChat
+
+
+class CampaignValidationError(ValueError):
+    """A campaign is not safe to activate or execute."""
+
+
+async def validate_campaign_ready(session: AsyncSession, campaign: Campaign) -> None:
+    account = await session.get(SenderAccount, campaign.sender_account_id)
+    if not account or not account.enabled:
+        raise CampaignValidationError("حساب ارسال‌کننده فعال و معتبر نیست.")
+    enabled_message = await session.scalar(
+        select(CampaignMessage.id)
+        .where(CampaignMessage.campaign_id == campaign.id, CampaignMessage.enabled.is_(True))
+        .limit(1)
+    )
+    if enabled_message is None:
+        raise CampaignValidationError("کمپین حداقل به یک پیام فعال نیاز دارد.")
+    await session.refresh(campaign, ["targets"])
+    if not any(
+        target.enabled and target.sender_account_id == campaign.sender_account_id
+        for target in campaign.targets
+    ):
+        raise CampaignValidationError("کمپین حداقل به یک گروه مقصد فعال نیاز دارد.")
+
+
+async def activate_campaign(
+    session: AsyncSession, campaign: Campaign, now: datetime | None = None
+) -> None:
+    await validate_campaign_ready(session, campaign)
+    campaign.enabled = True
+    campaign.next_run_at = campaign.next_run_at or calculate_next_run(
+        now or datetime.now(timezone.utc), campaign.interval_seconds
+    )
+
+
+async def normalize_message_positions(session: AsyncSession, campaign_id: int) -> None:
+    messages = list(
+        (
+            await session.scalars(
+                select(CampaignMessage)
+                .where(CampaignMessage.campaign_id == campaign_id)
+                .order_by(CampaignMessage.position, CampaignMessage.id)
+            )
+        ).all()
+    )
+    # Move through temporary unique positions before assigning the contiguous sequence.
+    for offset, message in enumerate(messages, start=1):
+        message.position = -offset
+    await session.flush()
+    for position, message in enumerate(messages, start=1):
+        message.position = position
+
+
+async def move_campaign_message(
+    session: AsyncSession, message: CampaignMessage, delta: int
+) -> bool:
+    if delta not in {-1, 1}:
+        raise ValueError("delta must be -1 or 1")
+    other = await session.scalar(
+        select(CampaignMessage).where(
+            CampaignMessage.campaign_id == message.campaign_id,
+            CampaignMessage.position == message.position + delta,
+        )
+    )
+    if other is None:
+        return False
+    old_position = message.position
+    message.position = -1
+    await session.flush()
+    other.position = old_position
+    await session.flush()
+    message.position = old_position + delta
+    return True
+
+
+async def pause_if_no_enabled_targets(session: AsyncSession, campaign: Campaign) -> bool:
+    await session.refresh(campaign, ["targets"])
+    has_target = any(
+        target.enabled and target.sender_account_id == campaign.sender_account_id
+        for target in campaign.targets
+    )
+    if campaign.enabled and not has_target:
+        campaign.enabled = False
+        campaign.next_run_at = None
+        return True
+    return False
 
 
 def parse_interval(value: str) -> int:

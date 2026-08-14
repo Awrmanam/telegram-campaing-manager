@@ -76,6 +76,8 @@ class Campaign(Base):
     execution_token: Mapped[str | None] = mapped_column(String(64), index=True)
     execution_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     delivery_cursor: Mapped[int] = mapped_column(default=0)
+    manual_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    manual_delivery_cursor: Mapped[int] = mapped_column(default=0)
     messages: Mapped[list["CampaignMessage"]] = relationship(
         cascade="all, delete-orphan", lazy="selectin"
     )

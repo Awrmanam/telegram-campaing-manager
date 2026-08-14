@@ -10,10 +10,21 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, ErrorEvent, Message
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import selectinload
+from telethon.errors import RPCError
 
 from app.bot.keyboards import confirm_keyboard, main_menu, rows_keyboard
 from app.bot.states import CampaignWizard, TextInput
-from app.campaigns.service import calculate_next_run, parse_interval, validate_targets
+from app.campaigns.service import (
+    CampaignValidationError,
+    activate_campaign,
+    calculate_next_run,
+    move_campaign_message,
+    normalize_message_positions,
+    parse_interval,
+    pause_if_no_enabled_targets,
+    validate_campaign_ready,
+    validate_targets,
+)
 from app.database.models import (
     Campaign,
     CampaignMessage,
@@ -24,6 +35,7 @@ from app.database.models import (
     SenderAccount,
     TargetChat,
 )
+from app.services.media_service import remove_managed_media, replace_message_content
 
 
 def _interval(seconds: int) -> str:
@@ -350,10 +362,11 @@ def build_router(
         cid = int(call.data.rsplit(":", 1)[1])
         async with sessions() as session:
             campaign = await session.get(Campaign, cid)
-            campaign.enabled = True
-            campaign.next_run_at = campaign.next_run_at or calculate_next_run(
-                datetime.now(timezone.utc), campaign.interval_seconds
-            )
+            try:
+                await activate_campaign(session, campaign)
+            except CampaignValidationError as exc:
+                await call.answer(str(exc), show_alert=True)
+                return
             await session.commit()
         if scheduler:
             scheduler.schedule(cid, campaign.next_run_at)
@@ -455,8 +468,20 @@ def build_router(
     async def delete_campaign(call: CallbackQuery) -> None:
         cid = int(call.data.rsplit(":", 1)[1])
         async with sessions() as session:
+            media_paths = list(
+                (
+                    await session.scalars(
+                        select(CampaignMessage.media_path).where(
+                            CampaignMessage.campaign_id == cid,
+                            CampaignMessage.media_path.is_not(None),
+                        )
+                    )
+                ).all()
+            )
             await session.execute(delete(Campaign).where(Campaign.id == cid))
             await session.commit()
+        for media_path in media_paths:
+            remove_managed_media(Path(media_path), media_directory)
         await call.message.edit_text("✅ کمپین حذف شد.")
 
     @router.callback_query(F.data.startswith("camp:sendask:"))
@@ -472,7 +497,15 @@ def build_router(
         if delivery is None:
             await call.answer("سرویس ارسال آماده نیست", show_alert=True)
             return
-        ok = await delivery.execute(int(call.data.rsplit(":", 1)[1]), manual=True)
+        cid = int(call.data.rsplit(":", 1)[1])
+        async with sessions() as session:
+            campaign = await session.get(Campaign, cid)
+            try:
+                await validate_campaign_ready(session, campaign)
+            except CampaignValidationError as exc:
+                await call.answer(str(exc), show_alert=True)
+                return
+        ok = await delivery.execute(cid, manual=True)
         await call.message.edit_text("✅ اجرا انجام شد." if ok else "❌ اجرا ممکن نبود.")
 
     # Campaign message CRUD and ordering
@@ -572,14 +605,7 @@ def build_router(
         data = await state.get_data()
         async with sessions() as session:
             item = await session.get(CampaignMessage, data["message_id"])
-            item.text = replacement["text"]
-            if replacement["message_type"] == "PHOTO":
-                media_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-                path = media_directory / f"message_{item.id}.jpg"
-                await message.bot.download(replacement["file_id"], destination=path)
-                item.message_type, item.media_path = MessageType.PHOTO, str(path)
-            elif item.message_type == MessageType.TEXT:
-                item.media_path = None
+            await replace_message_content(item, replacement, message.bot, media_directory)
             await session.commit()
         await state.clear()
         await message.answer("✅ ویرایش شد.")
@@ -589,21 +615,10 @@ def build_router(
         _, _, mid, delta = call.data.split(":")
         async with sessions() as session:
             item = await session.get(CampaignMessage, int(mid))
-            other = await session.scalar(
-                select(CampaignMessage).where(
-                    CampaignMessage.campaign_id == item.campaign_id,
-                    CampaignMessage.position == item.position + int(delta),
-                )
-            )
-            if other:
-                old = item.position
-                item.position = -1
-                await session.flush()
-                other.position = old
-                await session.flush()
-                item.position = old + int(delta)
+            moved = await move_campaign_message(session, item, int(delta))
+            if moved:
                 await session.commit()
-        await call.answer("جابجا شد" if other else "امکان جابجایی نیست", show_alert=not bool(other))
+        await call.answer("جابجا شد" if moved else "امکان جابجایی نیست", show_alert=not moved)
 
     @router.callback_query(F.data.startswith("msg:delask:"))
     async def message_delete_ask(call: CallbackQuery) -> None:
@@ -626,8 +641,12 @@ def build_router(
             if count <= 1:
                 await call.answer("کمپین باید حداقل یک پیام داشته باشد", show_alert=True)
                 return
+            obsolete_media = Path(item.media_path) if item.media_path else None
             await session.delete(item)
+            await session.flush()
+            await normalize_message_positions(session, cid)
             await session.commit()
+            remove_managed_media(obsolete_media, media_directory)
         await call.message.edit_text("✅ پیام حذف شد.")
 
     # Campaign target membership
@@ -673,10 +692,16 @@ def build_router(
             )
             if row:
                 await session.delete(row)
+                await session.flush()
+                paused = await pause_if_no_enabled_targets(session, campaign)
             else:
                 session.add(CampaignTarget(campaign_id=int(cid), target_chat_id=int(tid)))
+                paused = False
             await session.commit()
-        await call.answer("ذخیره شد")
+        await call.answer(
+            "آخرین گروه حذف و کمپین خودکار متوقف شد." if paused else "ذخیره شد",
+            show_alert=paused,
+        )
 
     # Account management
     @router.message(F.text == "👤 حساب‌های ارسال")
@@ -719,7 +744,7 @@ def build_router(
                 account.connection_status = "CONNECTED"
                 account.last_connected_at = datetime.now(timezone.utc)
                 text = "✅ اتصال برقرار است"
-            except Exception:
+            except (PermissionError, OSError, RPCError):
                 account.connection_status = "DISCONNECTED"
                 text = "❌ اتصال/مجوز معتبر نیست"
             await session.commit()
@@ -822,7 +847,7 @@ def build_router(
                 account = await session.get(SenderAccount, aid_i)
             try:
                 found = await chat_service.list_accessible(account)
-            except Exception:
+            except (PermissionError, OSError, RPCError):
                 await call.answer("دریافت گفتگوها ناموفق بود", show_alert=True)
                 return
             dialogs = [
@@ -910,8 +935,27 @@ def build_router(
         async with sessions() as session:
             target = await session.get(TargetChat, tid)
             target.enabled = not target.enabled
+            paused_names = []
+            if not target.enabled:
+                await session.flush()
+                campaign_ids = list(
+                    (
+                        await session.scalars(
+                            select(CampaignTarget.campaign_id).where(
+                                CampaignTarget.target_chat_id == tid
+                            )
+                        )
+                    ).all()
+                )
+                for campaign_id in campaign_ids:
+                    campaign = await session.get(Campaign, campaign_id)
+                    if await pause_if_no_enabled_targets(session, campaign):
+                        paused_names.append(campaign.name)
             await session.commit()
-        await call.answer("ذخیره شد", show_alert=True)
+        text = "ذخیره شد"
+        if paused_names:
+            text += "؛ کمپین متوقف شد: " + "، ".join(paused_names)
+        await call.answer(text, show_alert=True)
 
     @router.callback_query(F.data.startswith("target:delask:"))
     async def target_delask(call: CallbackQuery) -> None:
@@ -924,12 +968,28 @@ def build_router(
     async def target_delete(call: CallbackQuery) -> None:
         tid = int(call.data.rsplit(":", 1)[1])
         async with sessions() as session:
+            campaign_ids = list(
+                (
+                    await session.scalars(
+                        select(CampaignTarget.campaign_id).where(
+                            CampaignTarget.target_chat_id == tid
+                        )
+                    )
+                ).all()
+            )
             await session.execute(
                 delete(CampaignTarget).where(CampaignTarget.target_chat_id == tid)
             )
+            await session.flush()
+            paused_names = []
+            for campaign_id in campaign_ids:
+                campaign = await session.get(Campaign, campaign_id)
+                if await pause_if_no_enabled_targets(session, campaign):
+                    paused_names.append(campaign.name)
             await session.execute(delete(TargetChat).where(TargetChat.id == tid))
             await session.commit()
-        await call.message.edit_text("✅ ثبت گروه لغو شد.")
+        suffix = "\n⏸ کمپین‌های متوقف‌شده: " + "، ".join(paused_names) if paused_names else ""
+        await call.message.edit_text("✅ ثبت گروه لغو شد." + suffix)
 
     # Test send: sender -> registered target -> message/photo -> preview -> confirmation
     @router.message(F.text == "📨 ارسال آزمایشی")
@@ -1007,14 +1067,16 @@ def build_router(
             if item["message_type"] == "PHOTO":
                 media_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
                 temporary = media_directory / f"test_{call.from_user.id}_{call.id}.jpg"
-                await call.bot.download(item["file_id"], destination=temporary)
-                await client.send_file(
-                    target.telegram_chat_id,
-                    str(temporary),
-                    caption=item["text"],
-                    parse_mode="HTML",
-                )
-                temporary.unlink(missing_ok=True)
+                try:
+                    await call.bot.download(item["file_id"], destination=temporary)
+                    await client.send_file(
+                        target.telegram_chat_id,
+                        str(temporary),
+                        caption=item["text"],
+                        parse_mode="HTML",
+                    )
+                finally:
+                    temporary.unlink(missing_ok=True)
             else:
                 await client.send_message(target.telegram_chat_id, item["text"], parse_mode="HTML")
         await state.clear()
