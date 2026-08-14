@@ -8,10 +8,10 @@ from app.bot.middlewares import AdminMiddleware
 from app.campaigns.scheduler import CampaignScheduler
 from app.config import get_settings
 from app.database.session import create_database, initialize_database
-from app.services.delivery_service import DeliveryService
 from app.services.alert_service import AlertService
-from app.telegram.client_manager import ClientManager
+from app.services.delivery_service import DeliveryService
 from app.telegram.chat_service import ChatService
+from app.telegram.client_manager import ClientManager
 
 
 async def main() -> None:

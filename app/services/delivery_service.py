@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import random
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 from sqlalchemy import select, update
@@ -19,6 +19,7 @@ from app.campaigns.rotation import select_message
 from app.campaigns.service import (
     CampaignValidationError,
     calculate_next_run,
+    pause_campaign,
     validate_campaign_ready,
 )
 from app.database.models import Campaign, DeliveryLog, DeliveryStatus, MessageType, SenderAccount
@@ -41,7 +42,7 @@ class DeliveryService:
         self.alerts = alerts
 
     async def _claim(self, campaign_id: int, *, require_enabled: bool = True) -> str | None:
-        token, stale = uuid4().hex, datetime.now(timezone.utc) - timedelta(hours=1)
+        token, stale = uuid4().hex, datetime.now(UTC) - timedelta(hours=1)
         async with self.sessions() as session:
             conditions = [Campaign.id == campaign_id]
             if require_enabled:
@@ -52,7 +53,7 @@ class DeliveryService:
                     *conditions,
                     (Campaign.execution_token.is_(None)) | (Campaign.execution_started_at < stale),
                 )
-                .values(execution_token=token, execution_started_at=datetime.now(timezone.utc))
+                .values(execution_token=token, execution_started_at=datetime.now(UTC))
             )
             await session.commit()
             return token if result.rowcount == 1 else None
@@ -67,6 +68,7 @@ class DeliveryService:
                 await validate_campaign_ready(session, campaign)
             except CampaignValidationError as exc:
                 logger.warning("campaign_not_ready campaign_id=%s reason=%s", campaign_id, exc)
+                pause_campaign(campaign)
                 campaign.execution_token = campaign.execution_started_at = None
                 campaign.failure_count += 1
                 await session.commit()
@@ -75,11 +77,11 @@ class DeliveryService:
                 return False
             await session.refresh(campaign, ["messages", "targets"])
             account = await session.get(SenderAccount, campaign.sender_account_id)
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             if manual and campaign.manual_retry_at:
                 retry_at = campaign.manual_retry_at
                 if retry_at.tzinfo is None:
-                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                    retry_at = retry_at.replace(tzinfo=UTC)
                 if retry_at > now:
                     campaign.execution_token = campaign.execution_started_at = None
                     await session.commit()
@@ -104,16 +106,6 @@ class DeliveryService:
                         f"اتصال حساب {account.label} برای کمپین {campaign.name} برقرار نشد ({type(exc).__name__}).",
                     )
                 await self._finish(session, campaign, token, failed=True, manual=manual)
-                return False
-            except Exception as exc:
-                logger.exception("unexpected_sender_connection_error campaign_id=%s", campaign_id)
-                if self.alerts:
-                    await self.alerts.send(
-                        f"sender:{account.id}:unexpected_connection",
-                        f"خطای پیش‌بینی‌نشده اتصال حساب {account.label}: {type(exc).__name__}",
-                    )
-                campaign.execution_token = campaign.execution_started_at = None
-                await session.commit()
                 return False
             had_failure = False
             rate_limited_until = None
@@ -149,12 +141,12 @@ class DeliveryService:
                         str(exc)[:1000],
                     )
                     had_failure = True
-                    rate_limited_until = datetime.now(timezone.utc) + timedelta(seconds=exc.seconds)
+                    rate_limited_until = datetime.now(UTC) + timedelta(seconds=exc.seconds)
                     if manual:
                         campaign.manual_delivery_cursor = position
                     else:
                         campaign.delivery_cursor = position
-                    log.completed_at = datetime.now(timezone.utc)
+                    log.completed_at = datetime.now(UTC)
                     await session.commit()
                     if self.alerts:
                         await self.alerts.send(
@@ -174,7 +166,7 @@ class DeliveryService:
                         str(exc)[:1000],
                         True,
                     )
-                log.completed_at = datetime.now(timezone.utc)
+                log.completed_at = datetime.now(UTC)
                 await session.commit()
                 if position + 1 < len(targets):
                     await asyncio.sleep(random.uniform(self.min_delay, self.max_delay))
@@ -204,7 +196,7 @@ class DeliveryService:
             return True
 
     async def _finish(self, session, campaign, token: str, *, failed: bool, manual: bool) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         campaign.failure_count = campaign.failure_count + 1 if failed else 0
         campaign.last_run_at = now
         if not manual:

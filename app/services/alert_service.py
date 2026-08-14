@@ -1,7 +1,8 @@
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramAPIError
 from sqlalchemy import select
 
 from app.database.models import AdminAlert
@@ -15,7 +16,7 @@ class AlertService:
         self.cooldown = timedelta(seconds=cooldown_seconds)
 
     async def send(self, key: str, message: str) -> bool:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         async with self.sessions() as session:
             alert = await session.scalar(
                 select(AdminAlert).where(AdminAlert.deduplication_key == key)
@@ -23,7 +24,7 @@ class AlertService:
             if alert:
                 sent_at = alert.last_sent_at
                 if sent_at.tzinfo is None:
-                    sent_at = sent_at.replace(tzinfo=timezone.utc)
+                    sent_at = sent_at.replace(tzinfo=UTC)
                 alert.occurrence_count += 1
                 if now - sent_at < self.cooldown:
                     await session.commit()
@@ -35,7 +36,7 @@ class AlertService:
         for admin_id in self.admin_ids:
             try:
                 await self.bot.send_message(admin_id, f"⚠️ هشدار عملیاتی\n\n{message}")
-            except Exception as exc:
+            except (TelegramAPIError, OSError) as exc:
                 logger.warning(
                     "admin_alert_delivery_failed admin_id=%s error=%s", admin_id, type(exc).__name__
                 )

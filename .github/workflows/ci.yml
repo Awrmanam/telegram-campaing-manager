@@ -16,3 +16,4 @@ jobs:
       - run: ruff check .
       - run: pytest -q
       - run: python -c "import app.main"
+      - run: docker build -t telegram-campaign-manager:test .

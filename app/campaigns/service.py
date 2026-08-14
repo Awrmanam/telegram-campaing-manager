@@ -1,5 +1,5 @@
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,9 +35,43 @@ async def activate_campaign(
 ) -> None:
     await validate_campaign_ready(session, campaign)
     campaign.enabled = True
-    campaign.next_run_at = campaign.next_run_at or calculate_next_run(
-        now or datetime.now(timezone.utc), campaign.interval_seconds
+    campaign.next_run_at = calculate_next_run(
+        now or datetime.now(UTC), campaign.interval_seconds
     )
+
+
+def pause_campaign(campaign: Campaign) -> None:
+    campaign.enabled = False
+    campaign.next_run_at = None
+
+
+async def pause_sender_campaigns(
+    session: AsyncSession, sender_account_id: int
+) -> list[Campaign]:
+    campaigns = list(
+        (
+            await session.scalars(
+                select(Campaign).where(
+                    Campaign.sender_account_id == sender_account_id,
+                    Campaign.enabled.is_(True),
+                )
+            )
+        ).all()
+    )
+    for campaign in campaigns:
+        pause_campaign(campaign)
+    return campaigns
+
+
+async def disable_sender_account(
+    session: AsyncSession, account: SenderAccount, scheduler=None
+) -> list[Campaign]:
+    account.enabled = False
+    campaigns = await pause_sender_campaigns(session, account.id)
+    if scheduler:
+        for campaign in campaigns:
+            scheduler.cancel(campaign.id)
+    return campaigns
 
 
 async def normalize_message_positions(session: AsyncSession, campaign_id: int) -> None:
@@ -87,8 +121,7 @@ async def pause_if_no_enabled_targets(session: AsyncSession, campaign: Campaign)
         for target in campaign.targets
     )
     if campaign.enabled and not has_target:
-        campaign.enabled = False
-        campaign.next_run_at = None
+        pause_campaign(campaign)
         return True
     return False
 
@@ -111,13 +144,22 @@ def calculate_next_run(
 ) -> datetime:
     if interval_seconds <= 0:
         raise ValueError("interval must be positive")
-    base = base.astimezone(timezone.utc)
-    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    base = base.astimezone(UTC)
+    now = (now or datetime.now(UTC)).astimezone(UTC)
     candidate = base + timedelta(seconds=interval_seconds)
     if candidate > now:
         return candidate
     missed = int((now - base).total_seconds() // interval_seconds) + 1
     return base + timedelta(seconds=missed * interval_seconds)
+
+
+def retry_wait_seconds(retry_at: datetime | None, now: datetime | None = None) -> int:
+    if retry_at is None:
+        return 0
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=UTC)
+    remaining = (retry_at - (now or datetime.now(UTC))).total_seconds()
+    return max(0, int(remaining + 0.999))
 
 
 async def validate_targets(

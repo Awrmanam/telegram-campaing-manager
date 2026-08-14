@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -18,10 +18,13 @@ from app.campaigns.service import (
     CampaignValidationError,
     activate_campaign,
     calculate_next_run,
+    disable_sender_account,
     move_campaign_message,
     normalize_message_positions,
     parse_interval,
+    pause_campaign,
     pause_if_no_enabled_targets,
+    retry_wait_seconds,
     validate_campaign_ready,
     validate_targets,
 )
@@ -71,7 +74,7 @@ def build_router(
         if value is None:
             return "—"
         if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
+            value = value.replace(tzinfo=UTC)
         return value.astimezone(display_zone).strftime("%Y-%m-%d %H:%M")
 
     @router.errors()
@@ -378,8 +381,10 @@ def build_router(
         cid = int(call.data.rsplit(":", 1)[1])
         async with sessions() as session:
             campaign = await session.get(Campaign, cid)
-            campaign.enabled = False
+            pause_campaign(campaign)
             await session.commit()
+        if scheduler:
+            scheduler.cancel(cid)
         await show_campaign(call, cid)
         await call.answer("متوقف شد")
 
@@ -452,8 +457,10 @@ def build_router(
             campaign = await session.get(Campaign, data["campaign_id"])
             campaign.interval_seconds = seconds
             if campaign.enabled:
-                campaign.next_run_at = calculate_next_run(datetime.now(timezone.utc), seconds)
+                campaign.next_run_at = calculate_next_run(datetime.now(UTC), seconds)
             await session.commit()
+        if campaign.enabled and scheduler:
+            scheduler.schedule(campaign.id, campaign.next_run_at)
         await state.clear()
         await message.answer("✅ فاصله تغییر کرد.")
 
@@ -480,6 +487,8 @@ def build_router(
             )
             await session.execute(delete(Campaign).where(Campaign.id == cid))
             await session.commit()
+        if scheduler:
+            scheduler.cancel(cid)
         for media_path in media_paths:
             remove_managed_media(Path(media_path), media_directory)
         await call.message.edit_text("✅ کمپین حذف شد.")
@@ -500,6 +509,13 @@ def build_router(
         cid = int(call.data.rsplit(":", 1)[1])
         async with sessions() as session:
             campaign = await session.get(Campaign, cid)
+            remaining = retry_wait_seconds(campaign.manual_retry_at)
+            if remaining:
+                await call.answer(
+                    f"تلگرام توقف خواسته است؛ {remaining} ثانیه دیگر، در {display_time(campaign.manual_retry_at)} دوباره تلاش کنید.",
+                    show_alert=True,
+                )
+                return
             try:
                 await validate_campaign_ready(session, campaign)
             except CampaignValidationError as exc:
@@ -698,6 +714,8 @@ def build_router(
                 session.add(CampaignTarget(campaign_id=int(cid), target_chat_id=int(tid)))
                 paused = False
             await session.commit()
+        if paused and scheduler:
+            scheduler.cancel(int(cid))
         await call.answer(
             "آخرین گروه حذف و کمپین خودکار متوقف شد." if paused else "ذخیره شد",
             show_alert=paused,
@@ -742,7 +760,7 @@ def build_router(
             try:
                 await chat_service.clients.get(account)
                 account.connection_status = "CONNECTED"
-                account.last_connected_at = datetime.now(timezone.utc)
+                account.last_connected_at = datetime.now(UTC)
                 text = "✅ اتصال برقرار است"
             except (PermissionError, OSError, RPCError):
                 account.connection_status = "DISCONNECTED"
@@ -755,9 +773,20 @@ def build_router(
         aid = int(call.data.rsplit(":", 1)[1])
         async with sessions() as session:
             account = await session.get(SenderAccount, aid)
-            account.enabled = not account.enabled
+            paused_campaigns = []
+            if account.enabled:
+                campaigns = await disable_sender_account(session, account, scheduler)
+                paused_campaigns = [(campaign.id, campaign.name) for campaign in campaigns]
+            else:
+                account.enabled = True
             await session.commit()
-        await call.answer("ذخیره شد", show_alert=True)
+        text = "حساب فعال شد؛ کمپین‌ها باید صریحاً شروع شوند."
+        if not account.enabled:
+            names = "، ".join(name for _, name in paused_campaigns)
+            text = "حساب غیرفعال شد."
+            if names:
+                text += " کمپین‌های متوقف‌شده: " + names
+        await call.answer(text, show_alert=True)
 
     @router.callback_query(F.data.startswith("acct:delask:"))
     async def account_delete_ask(call: CallbackQuery) -> None:
@@ -900,7 +929,7 @@ def build_router(
             )
             if existing:
                 existing.enabled = True
-                existing.last_verified_at = datetime.now(timezone.utc)
+                existing.last_verified_at = datetime.now(UTC)
             else:
                 session.add(
                     TargetChat(
@@ -910,7 +939,7 @@ def build_router(
                         username=item["username"],
                         chat_type=item["chat_type"],
                         enabled=True,
-                        last_verified_at=datetime.now(timezone.utc),
+                        last_verified_at=datetime.now(UTC),
                     )
                 )
             await session.commit()
@@ -935,7 +964,7 @@ def build_router(
         async with sessions() as session:
             target = await session.get(TargetChat, tid)
             target.enabled = not target.enabled
-            paused_names = []
+            paused_campaigns = []
             if not target.enabled:
                 await session.flush()
                 campaign_ids = list(
@@ -950,11 +979,16 @@ def build_router(
                 for campaign_id in campaign_ids:
                     campaign = await session.get(Campaign, campaign_id)
                     if await pause_if_no_enabled_targets(session, campaign):
-                        paused_names.append(campaign.name)
+                        paused_campaigns.append((campaign.id, campaign.name))
             await session.commit()
+        if scheduler:
+            for campaign_id, _ in paused_campaigns:
+                scheduler.cancel(campaign_id)
         text = "ذخیره شد"
-        if paused_names:
-            text += "؛ کمپین متوقف شد: " + "، ".join(paused_names)
+        if paused_campaigns:
+            text += "؛ کمپین متوقف شد: " + "، ".join(
+                name for _, name in paused_campaigns
+            )
         await call.answer(text, show_alert=True)
 
     @router.callback_query(F.data.startswith("target:delask:"))
@@ -981,14 +1015,22 @@ def build_router(
                 delete(CampaignTarget).where(CampaignTarget.target_chat_id == tid)
             )
             await session.flush()
-            paused_names = []
+            paused_campaigns = []
             for campaign_id in campaign_ids:
                 campaign = await session.get(Campaign, campaign_id)
                 if await pause_if_no_enabled_targets(session, campaign):
-                    paused_names.append(campaign.name)
+                    paused_campaigns.append((campaign.id, campaign.name))
             await session.execute(delete(TargetChat).where(TargetChat.id == tid))
             await session.commit()
-        suffix = "\n⏸ کمپین‌های متوقف‌شده: " + "، ".join(paused_names) if paused_names else ""
+        if scheduler:
+            for campaign_id, _ in paused_campaigns:
+                scheduler.cancel(campaign_id)
+        suffix = (
+            "\n⏸ کمپین‌های متوقف‌شده: "
+            + "، ".join(name for _, name in paused_campaigns)
+            if paused_campaigns
+            else ""
+        )
         await call.message.edit_text("✅ ثبت گروه لغو شد." + suffix)
 
     # Test send: sender -> registered target -> message/photo -> preview -> confirmation
@@ -1117,7 +1159,7 @@ def build_router(
         today = (
             datetime.now(display_zone)
             .replace(hour=0, minute=0, second=0, microsecond=0)
-            .astimezone(timezone.utc)
+            .astimezone(UTC)
         )
         async with sessions() as session:
             success = await session.scalar(
