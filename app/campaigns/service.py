@@ -35,9 +35,8 @@ async def activate_campaign(
 ) -> None:
     await validate_campaign_ready(session, campaign)
     campaign.enabled = True
-    campaign.next_run_at = calculate_next_run(
-        now or datetime.now(UTC), campaign.interval_seconds
-    )
+    base = now or datetime.now(UTC)
+    campaign.next_run_at = calculate_next_run(base, campaign.interval_seconds, base)
 
 
 def pause_campaign(campaign: Campaign) -> None:

@@ -74,7 +74,14 @@ def test_complete_ui_routes_are_registered():
 
 def test_rotation_persists_index_and_wraps():
     messages = [
-        CampaignMessage(id=i, campaign_id=1, position=i, message_type=MessageType.TEXT, text=str(i))
+        CampaignMessage(
+            id=i,
+            campaign_id=1,
+            position=i,
+            message_type=MessageType.TEXT,
+            text=str(i),
+            enabled=True,
+        )
         for i in range(1, 5)
     ]
     selected, index = select_message(messages, 3)
