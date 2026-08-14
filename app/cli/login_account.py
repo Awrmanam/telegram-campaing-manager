@@ -25,7 +25,11 @@ async def run() -> None:
         if await session.scalar(select(SenderAccount).where(SenderAccount.label == label)):
             raise SystemExit("This account label already exists")
     phone = getpass.getpass("Phone number (hidden): ")
-    client = TelegramClient(str(settings.session_directory / label), settings.telegram_api_id, settings.telegram_api_hash)
+    client = TelegramClient(
+        str(settings.session_directory / label),
+        settings.telegram_api_id,
+        settings.telegram_api_hash,
+    )
     try:
         await client.connect()
         if not await client.is_user_authorized():
@@ -34,15 +38,30 @@ async def run() -> None:
             try:
                 await client.sign_in(phone, code, phone_code_hash=sent.phone_code_hash)
             except SessionPasswordNeededError:
-                await client.sign_in(password=getpass.getpass("Two-step verification password (hidden): "))
+                await client.sign_in(
+                    password=getpass.getpass("Two-step verification password (hidden): ")
+                )
         me = await client.get_me()
         async with sessions() as session:
-            duplicate = await session.scalar(select(SenderAccount).where(or_(SenderAccount.telegram_user_id == me.id, SenderAccount.session_name == label)))
+            duplicate = await session.scalar(
+                select(SenderAccount).where(
+                    or_(
+                        SenderAccount.telegram_user_id == me.id, SenderAccount.session_name == label
+                    )
+                )
+            )
             if duplicate:
                 raise SystemExit("This Telegram account is already registered")
-            session.add(SenderAccount(label=label, telegram_user_id=me.id, username=me.username,
-                display_name=" ".join(filter(None, [me.first_name, me.last_name])), session_name=label,
-                connection_status="CONNECTED"))
+            session.add(
+                SenderAccount(
+                    label=label,
+                    telegram_user_id=me.id,
+                    username=me.username,
+                    display_name=" ".join(filter(None, [me.first_name, me.last_name])),
+                    session_name=label,
+                    connection_status="CONNECTED",
+                )
+            )
             await session.commit()
         print(f"Account '{label}' registered successfully (Telegram user ID: {me.id}).")
     finally:

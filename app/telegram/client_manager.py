@@ -16,7 +16,9 @@ class ClientManager:
         async with self._lock:
             client = self._clients.get(account.id)
             if client is None:
-                client = TelegramClient(str(self.directory / account.session_name), self.api_id, self.api_hash)
+                client = TelegramClient(
+                    str(self.directory / account.session_name), self.api_id, self.api_hash
+                )
                 await client.connect()
                 if not await client.is_user_authorized():
                     await client.disconnect()
@@ -25,5 +27,7 @@ class ClientManager:
             return client
 
     async def close(self) -> None:
-        await asyncio.gather(*(client.disconnect() for client in self._clients.values()), return_exceptions=True)
+        await asyncio.gather(
+            *(client.disconnect() for client in self._clients.values()), return_exceptions=True
+        )
         self._clients.clear()

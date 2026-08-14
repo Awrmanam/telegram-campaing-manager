@@ -16,7 +16,9 @@ class CampaignScheduler:
     async def restore(self) -> None:
         now = datetime.now(timezone.utc)
         async with self.sessions() as session:
-            campaigns = list((await session.scalars(select(Campaign).where(Campaign.enabled.is_(True)))).all())
+            campaigns = list(
+                (await session.scalars(select(Campaign).where(Campaign.enabled.is_(True)))).all()
+            )
             for campaign in campaigns:
                 due = campaign.next_run_at or now
                 if due.tzinfo is None:
@@ -28,7 +30,14 @@ class CampaignScheduler:
             await session.commit()
 
     def schedule(self, campaign_id: int, when: datetime) -> None:
-        self.scheduler.add_job(self._run, DateTrigger(run_date=when), args=[campaign_id], id=f"campaign-{campaign_id}", replace_existing=True, misfire_grace_time=300)
+        self.scheduler.add_job(
+            self._run,
+            DateTrigger(run_date=when),
+            args=[campaign_id],
+            id=f"campaign-{campaign_id}",
+            replace_existing=True,
+            misfire_grace_time=300,
+        )
 
     async def _run(self, campaign_id: int) -> None:
         await self.delivery.execute(campaign_id)

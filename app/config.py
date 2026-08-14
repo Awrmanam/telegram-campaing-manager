@@ -1,14 +1,15 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Annotated
 
 from pydantic import field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
     bot_token: str = ""
-    admin_ids: frozenset[int] = frozenset()
+    admin_ids: Annotated[frozenset[int], NoDecode] = frozenset()
     telegram_api_id: int = 0
     telegram_api_hash: str = ""
     database_url: str = "sqlite+aiosqlite:///./data/app.db"

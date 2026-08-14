@@ -39,7 +39,7 @@ python -m app.main
 
 CLI ابتدا label، سپس شماره، OTP و در صورت نیاز رمز دومرحله‌ای را به شکل hidden می‌گیرد. این اسرار در DB/log ذخیره نمی‌شوند. تکراری بودن label و Telegram user ID کنترل می‌شود. برای حساب اضافی همان `login_account` را با label جدید اجرا کنید.
 
-`list_dialogs` فقط گروه/کانال‌های موجود را چاپ می‌کند و **هیچ‌کدام را ثبت نمی‌کند**. ثبت TargetChat تصمیم صریح مدیر است. پس از ثبت گروه‌های مجاز، در پنل «➕ کمپین جدید»، حساب، فاصله، گروه‌ها و پیام HTML یا photo/caption را انتخاب کنید؛ سپس کمپین را شروع/متوقف کنید. نسخه فعلی پنل فهرست‌ها و گزارش را ارائه می‌دهد و ایجاد پیشرفته از لایه service/DB انجام می‌شود؛ UI کامل ویرایش در محدودیت‌ها آمده است.
+`list_dialogs` فقط گروه/کانال‌های موجود را چاپ می‌کند و **هیچ‌کدام را ثبت نمی‌کند**. در پنل «👥 گروه‌ها» حساب را انتخاب، گفتگوها را صفحه‌بندی و هر مقصد مجاز را صریحاً ثبت کنید. wizard «➕ کمپین جدید» نام، حساب، فاصله، چند گروه، متن یا عکس، پیش‌نمایش و تأیید دارد. جزئیات کمپین همه عملیات مدیریت، پیام‌ها، گروه‌ها و ارسال دستی را ارائه می‌دهد؛ گروه‌ها هنگام تغییر حساب هرگز خودکار منتقل نمی‌شوند.
 
 ## Docker و اولین ورود
 
@@ -101,7 +101,7 @@ docker compose up -d
 * `BOT_TOKEN is required`: `.env` و env_file را بررسی کنید.
 * authorization expired: container را stop، CLI login را اجرا و سپس start کنید؛ هرگز session را در bot نفرستید.
 * `database is locked`: فقط یک instance اجرا کنید؛ WAL و busy timeout فعال‌اند.
-* `FloodWait`: صبر دقیق بخشی از طراحی است؛ delay را کم نکنید و حساب جایگزین نسازید.
+* `FloodWait`: اجرای ناقص rotation را جلو نمی‌برد؛ موعد یک retry روشن بعد از زمان اعلام‌شده ثبت می‌شود. حساب جایگزین یا retry بی‌نهایت وجود ندارد.
 * write forbidden/private/banned: مجوز و عضویت حساب انتخابی را بررسی و target نامعتبر را غیرفعال کنید.
 * تست: `pytest -q`؛ lint: `ruff check .`؛ import: `python -c 'import app.main'`.
 
@@ -111,4 +111,6 @@ docker compose up -d
 
 ## محدودیت‌ها و گام بعد
 
-این release تک-instance/SQLite است. ثبت dialog انتخاب‌شده، wizard کامل FSM، دکمه‌های CRUD حساب/کمپین، ذخیره امن photo از bot، preview، و alert cooldown در UI هنوز باید تکمیل شوند؛ هسته allowlist، delivery، pacing، خطا، persistence، Docker و CLI عملیاتی‌اند. پیش از production: تست staging با گروه خصوصی مجاز، افزودن Alembic، مانیتورینگ disk/backup، تست restore، و بازبینی مجوز فایل volume انجام شود. هیچ credential واقعی همراه repository نیست.
+این release برای یک instance و SQLite طراحی شده و migration نسخه‌ای Alembic، PostgreSQL، webhook و داشبورد وب ندارد. گزارش پنل فعلاً تجمعی است و فیلتر صفحه‌بندی‌شده روز/خطا ندارد. APScheduler job store حافظه‌ای است اما `next_run_at` پایگاه‌داده منبع حقیقت و در startup بازسازی می‌شود. پیش از production تست staging، Alembic، مانیتورینگ، تست restore و بازبینی مجوز volume توصیه می‌شود. هیچ credential واقعی همراه repository نیست.
+
+موارد صریح باقی‌مانده از دامنه اولیه: Alembic «اختیاری» بود و عمداً وجود ندارد؛ backend فقط SQLite تک-instance است؛ VIDEO/DOCUMENT طبق درخواست فقط توسعه‌پذیرند و هنوز پشتیبانی نمی‌شوند؛ گزارش امروز/خطا/حساب موجود است اما pagination و خروجی فایل ندارد؛ alertها برای خطای اتصال، rate limit، خطاهای تحویل و خطای پنل هستند ولی سامانه مانیتورینگ بیرونی جایگزین نمی‌کنند. سایر workflowهای درخواستی پنل، CLI، allowlist، scheduler، delivery، Docker و آزمون‌ها پیاده‌سازی شده‌اند.

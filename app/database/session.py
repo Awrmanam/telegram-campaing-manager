@@ -11,6 +11,7 @@ def create_database(url: str) -> tuple[AsyncEngine, async_sessionmaker]:
         Path(url.split("///", 1)[1]).parent.mkdir(parents=True, exist_ok=True)
     engine = create_async_engine(url)
     if url.startswith("sqlite"):
+
         @event.listens_for(engine.sync_engine, "connect")
         def pragmas(connection, _record):  # type: ignore[no-untyped-def]
             cursor = connection.cursor()
@@ -18,6 +19,7 @@ def create_database(url: str) -> tuple[AsyncEngine, async_sessionmaker]:
             cursor.execute("PRAGMA foreign_keys=ON")
             cursor.execute("PRAGMA busy_timeout=5000")
             cursor.close()
+
     return engine, async_sessionmaker(engine, expire_on_commit=False)
 
 

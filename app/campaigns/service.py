@@ -8,7 +8,9 @@ from app.database.models import Campaign, TargetChat
 
 
 def parse_interval(value: str) -> int:
-    match = re.fullmatch(r"\s*(\d+)\s*(m|min|minute|minutes|دقیقه|h|hr|hour|hours|ساعت)\s*", value.lower())
+    match = re.fullmatch(
+        r"\s*(\d+)\s*(m|min|minute|minutes|دقیقه|h|hr|hour|hours|ساعت)\s*", value.lower()
+    )
     if not match:
         raise ValueError("فاصله را مانند 30m یا 2h وارد کنید")
     amount = int(match.group(1))
@@ -18,7 +20,9 @@ def parse_interval(value: str) -> int:
     return seconds
 
 
-def calculate_next_run(base: datetime, interval_seconds: int, now: datetime | None = None) -> datetime:
+def calculate_next_run(
+    base: datetime, interval_seconds: int, now: datetime | None = None
+) -> datetime:
     if interval_seconds <= 0:
         raise ValueError("interval must be positive")
     base = base.astimezone(timezone.utc)
@@ -30,9 +34,15 @@ def calculate_next_run(base: datetime, interval_seconds: int, now: datetime | No
     return base + timedelta(seconds=missed * interval_seconds)
 
 
-async def validate_targets(session: AsyncSession, sender_id: int, target_ids: set[int]) -> list[TargetChat]:
-    targets = list((await session.scalars(select(TargetChat).where(TargetChat.id.in_(target_ids)))).all())
-    if len(targets) != len(target_ids) or any(target.sender_account_id != sender_id for target in targets):
+async def validate_targets(
+    session: AsyncSession, sender_id: int, target_ids: set[int]
+) -> list[TargetChat]:
+    targets = list(
+        (await session.scalars(select(TargetChat).where(TargetChat.id.in_(target_ids)))).all()
+    )
+    if len(targets) != len(target_ids) or any(
+        target.sender_account_id != sender_id for target in targets
+    ):
         raise ValueError("همه گروه‌ها باید به حساب انتخاب‌شده تعلق داشته باشند")
     return targets
 
@@ -42,4 +52,10 @@ async def eligible_campaign(session: AsyncSession, campaign_id: int) -> Campaign
     if not campaign or not campaign.enabled:
         return None
     await session.refresh(campaign, ["targets"])
-    return campaign if all(target.sender_account_id == campaign.sender_account_id for target in campaign.targets) else None
+    return (
+        campaign
+        if all(
+            target.sender_account_id == campaign.sender_account_id for target in campaign.targets
+        )
+        else None
+    )
