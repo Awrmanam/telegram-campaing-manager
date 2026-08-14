@@ -13,8 +13,7 @@ class AdminMiddleware(BaseMiddleware):
     async def __call__(self, handler, event: TelegramObject, data: dict):  # type: ignore[no-untyped-def]
         user = data.get("event_from_user")
         if not is_admin(getattr(user, "id", None), self.admin_ids):
-            if message := getattr(event, "message", event):
-                if hasattr(message, "answer"):
-                    await message.answer("⛔ دسترسی مجاز نیست.")
+            if (message := getattr(event, "message", event)) and hasattr(message, "answer"):
+                await message.answer("⛔ دسترسی مجاز نیست.")
             return None
         return await handler(event, data)

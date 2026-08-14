@@ -205,7 +205,7 @@ async def test_disabled_group_excluded(sessions):
 
 @pytest.mark.asyncio
 async def test_zero_target_campaign_fails_without_rotation(sessions):
-    _, target_id, campaign_id = await seed(sessions)
+    _, _, campaign_id = await seed(sessions)
     async with sessions() as session:
         campaign = await session.get(Campaign, campaign_id)
         campaign.targets.clear()
@@ -489,7 +489,8 @@ async def test_disabling_sender_pauses_campaigns_without_auto_restart(sessions):
     account_id, _, campaign_id = await seed(sessions)
 
     class SchedulerSpy:
-        canceled = []
+        def __init__(self):
+            self.canceled = []
 
         def cancel(self, value):
             self.canceled.append(value)
