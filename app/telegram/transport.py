@@ -1,8 +1,12 @@
 """MTProto entity resolution and native forwarding of source posts/albums."""
 from __future__ import annotations
 
+import logging
+
 from telethon import functions, types, utils
 from telethon.errors import RPCError
+
+logger = logging.getLogger(__name__)
 
 
 async def resolve_peer(client, reference: str | int):
@@ -87,8 +91,8 @@ async def forward_original(
             # Fail closed: don't leave a silently misrouted post in General.
             try:
                 await client.delete_messages(dest_peer, sent_ids)
-            except Exception:
-                pass
+            except (RPCError, OSError, ValueError):
+                logger.exception("failed_to_delete_wrong_topic_forward")
             raise ValueError(
                 "تلگرام فوروارد را به تاپیک انتخابی هدایت نکرد؛ "
                 "ارسال تأیید نشد. تاپیک را بررسی کنید."
