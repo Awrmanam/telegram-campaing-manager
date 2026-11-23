@@ -1230,6 +1230,36 @@ def build_router(
             except (PermissionError, OSError, RPCError):
                 await call.answer("دریافت گفتگوها ناموفق بود", show_alert=True)
                 return
+            # Refresh already registered groups without requiring another registration.
+            # Pause campaigns if a legacy target turned out to be a Forum with no topic.
+            paused_for_forum = []
+            async with sessions() as session:
+                registered = list((await session.scalars(
+                    select(TargetChat).where(TargetChat.sender_account_id == aid_i)
+                )).all())
+                found_by_id = {x.telegram_chat_id: x for x in found}
+                for group in registered:
+                    actual = found_by_id.get(group.telegram_chat_id)
+                    if actual is None:
+                        continue
+                    if group.is_forum != actual.is_forum:
+                        group.is_forum = actual.is_forum
+                        if actual.is_forum:
+                            links = list((await session.scalars(
+                                select(CampaignTarget).where(
+                                    CampaignTarget.target_chat_id == group.id,
+                                    CampaignTarget.topic_id.is_(None),
+                                )
+                            )).all())
+                            for link in links:
+                                campaign = await session.get(Campaign, link.campaign_id)
+                                if campaign.enabled:
+                                    pause_campaign(campaign)
+                                    paused_for_forum.append(campaign.id)
+                await session.commit()
+            if scheduler:
+                for cid in set(paused_for_forum):
+                    scheduler.cancel(cid)
             dialogs = [
                 x.__dict__
                 if hasattr(x, "__dict__")
