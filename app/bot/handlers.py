@@ -1138,13 +1138,14 @@ def build_router(
                     "title": x.title,
                     "username": x.username,
                     "chat_type": x.chat_type,
+                    "is_forum": x.is_forum,
                 }
                 for x in found
             ]
             await state.update_data({f"dialogs_{aid}": dialogs})
         page_rows = dialogs[page_i * 8 : (page_i + 1) * 8]
         buttons = [
-            (x["title"], f"groups:register:{aid}:{page}:{i + page_i * 8}")
+            (("🧵 " if x.get("is_forum") else "") + x["title"], f"groups:register:{aid}:{page}:{i + page_i * 8}")
             for i, x in enumerate(page_rows)
         ]
         if page_i:
@@ -1180,6 +1181,7 @@ def build_router(
             )
             if existing:
                 existing.enabled = True
+                existing.is_forum = bool(item.get("is_forum", False))
                 existing.last_verified_at = datetime.now(UTC)
             else:
                 session.add(
@@ -1189,12 +1191,15 @@ def build_router(
                         title=item["title"],
                         username=item["username"],
                         chat_type=item["chat_type"],
+                        is_forum=bool(item.get("is_forum", False)),
                         enabled=True,
                         last_verified_at=datetime.now(UTC),
                     )
                 )
             await session.commit()
-        await call.message.edit_text("✅ گروه صریحاً در allowlist ثبت شد.")
+        await call.message.edit_text(
+            "✅ گروه ثبت شد." + (" 🧵 این گروه تاپیک دارد؛ موقع انتخاب مقصد، فهرست تاپیک‌ها نمایش داده می‌شود." if item.get("is_forum") else "")
+        )
 
     @router.callback_query(F.data.startswith("target:view:"))
     async def target_view(call: CallbackQuery) -> None:
@@ -1205,9 +1210,37 @@ def build_router(
             f"{target.title}\n<code>{target.telegram_chat_id}</code>",
             parse_mode="HTML",
             reply_markup=rows_keyboard(
-                [("فعال/غیرفعال", f"target:toggle:{tid}"), ("لغو ثبت", f"target:delask:{tid}")]
+                ([("🧵 فهرست تاپیک‌ها", f"groups:topics:{tid}:0")] if target.is_forum else [])
+                + [("فعال/غیرفعال", f"target:toggle:{tid}"), ("لغو ثبت", f"target:delask:{tid}")]
             ),
         )
+
+    @router.callback_query(F.data.startswith("groups:topics:"))
+    async def groups_topic_list(call: CallbackQuery) -> None:
+        _, _, tid, page = call.data.split(":")
+        async with sessions() as session:
+            target = await session.get(TargetChat, int(tid))
+        topics = await fetch_target_topics(target)
+        current = int(page)
+        if not topics:
+            await call.answer("تاپیک باز و قابل‌انتخابی پیدا نشد.", show_alert=True)
+            return
+        rows = [(f"🧵 {t['title'][:48]}", "noop:topic")
+                for t in topics[current * 8:(current + 1) * 8]]
+        if current:
+            rows.append(("⬅️ قبلی", f"groups:topics:{tid}:{current - 1}"))
+        if (current + 1) * 8 < len(topics):
+            rows.append(("بعدی ➡️", f"groups:topics:{tid}:{current + 1}"))
+        await call.message.edit_text(
+            f"🧵 تاپیک‌های باز گروه «{target.title}».\n"
+            "برای انتخاب مقصد، از بخش ارسال آزمایشی یا گروه‌های کمپین استفاده کن.",
+            reply_markup=rows_keyboard(rows, back=f"target:view:{tid}"),
+        )
+        await call.answer()
+
+    @router.callback_query(F.data == "noop:topic")
+    async def no_op_topic(call: CallbackQuery) -> None:
+        await call.answer("تاپیک را هنگام ساخت کمپین یا ارسال آزمایشی انتخاب کنید.")
 
     @router.callback_query(F.data.startswith("target:toggle:"))
     async def target_toggle(call: CallbackQuery) -> None:
