@@ -1155,35 +1155,56 @@ def build_router(
 
     @router.callback_query(TextInput.test_preview, F.data == "test:send")
     async def test_send(call: CallbackQuery, state: FSMContext) -> None:
+        await call.answer("⏳ در حال بررسی ارسال...")
         data = await state.get_data()
-        async with sessions() as session:
-            account, target = (
-                await session.get(SenderAccount, data["test_sender_id"]),
-                await session.get(TargetChat, data["test_target_id"]),
-            )
-            if not account.enabled or not target.enabled or target.sender_account_id != account.id:
-                await call.answer("حساب یا گروه دیگر مجاز نیست", show_alert=True)
-                return
-            client = await chat_service.clients.get(account)
-            item = data["test_item"]
-            if item["message_type"] == "PHOTO":
-                media_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-                temporary = media_directory / f"test_{call.from_user.id}_{call.id}.jpg"
-                try:
-                    await call.bot.download(item["file_id"], destination=temporary)
-                    await client.send_file(
-                        target.telegram_chat_id,
-                        str(temporary),
-                        caption=item["text"],
-                        parse_mode="HTML",
+        try:
+            async with sessions() as session:
+                account, target = (
+                    await session.get(SenderAccount, data["test_sender_id"]),
+                    await session.get(TargetChat, data["test_target_id"]),
+                )
+                if not account or not target or not account.enabled or not target.enabled \
+                        or target.sender_account_id != account.id:
+                    await call.message.answer("❌ حساب یا گروه مجاز نیست.")
+                    return
+                client = await chat_service.clients.get(account)
+                item = data["test_item"]
+                peer = await resolve_peer(client, target.telegram_chat_id)
+                if item["message_type"] == "FORWARD":
+                    await forward_original(
+                        client, target.telegram_chat_id,
+                        item["forward_chat_ref"], item["forward_message_id"],
                     )
-                finally:
-                    temporary.unlink(missing_ok=True)
-            else:
-                await client.send_message(target.telegram_chat_id, item["text"], parse_mode="HTML")
+                elif item["message_type"] == "PHOTO":
+                    media_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    temporary = media_directory / f"test_{call.from_user.id}_{call.id}.jpg"
+                    try:
+                        await call.bot.download(item["file_id"], destination=temporary)
+                        await client.send_file(
+                            peer, str(temporary), caption=item["text"], parse_mode=None,
+                        )
+                    finally:
+                        temporary.unlink(missing_ok=True)
+                else:
+                    await client.send_message(peer, item["text"], parse_mode=None)
+        except Exception as exc:
+            logger.exception("test_delivery_failed")
+            await call.message.answer(
+                f"❌ ارسال انجام نشد: {type(exc).__name__}\n"
+                f"{str(exc)[:250]}\n"
+                "عضویت اکانت در گروه، اجازه ارسال و دسترسی به پست مبدأ را بررسی کنید."
+            )
+            return
         await state.clear()
         await call.message.edit_reply_markup()
-        await call.message.answer("✅ ارسال آزمایشی انجام شد؛ زمان‌بندی و rotation تغییر نکرد.")
+        await call.message.answer("✅ ارسال آزمایشی موفق بود؛ زمان‌بندی تغییر نکرد.")
+
+    @router.callback_query(F.data == "test:send")
+    async def expired_test_confirmation(call: CallbackQuery) -> None:
+        await call.answer(
+            "تأیید قدیمی منقضی شده؛ از /start ارسال آزمایشی جدید بسازید.",
+            show_alert=True,
+        )
 
     @router.message(F.text == "📊 گزارش‌ها")
     async def reports(message: Message) -> None:
