@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.campaigns.per_target import active_links, aware
 from app.campaigns.service import activate_campaign
 from app.database.models import (
-    Base, Campaign, CampaignMessage, MessageType, SenderAccount, TargetChat,
+    Base, Campaign, CampaignMessage, CampaignTarget, MessageType, SenderAccount, TargetChat,
 )
 from app.telegram.transport import forward_original, resolve_peer
 
@@ -81,9 +81,7 @@ async def test_group_intervals_create_independent_due_dates():
         ))
         session.add(campaign)
         await session.flush()
-        links = list((await session.scalars(select(
-            __import__("app.database.models", fromlist=["CampaignTarget"]).CampaignTarget
-        ))).all())
+        links = list((await session.scalars(select(CampaignTarget))).all())
         assert len(links) == 2
         links[0].interval_seconds = 3600
         links[1].interval_seconds = 7200
