@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import logging
+from secrets import randbits
 
-from telethon import functions, types, utils
+from telethon import functions, types
 from telethon.errors import RPCError
 
 logger = logging.getLogger(__name__)
@@ -66,7 +67,7 @@ async def forward_original(
             functions.messages.ForwardMessagesRequest(
                 from_peer=src_peer,
                 id=ids,
-                random_id=[utils.generate_random_long() for _ in ids],
+                random_id=[randbits(63) for _ in ids],
                 to_peer=dest_peer,
                 top_msg_id=topic_id,
             )
