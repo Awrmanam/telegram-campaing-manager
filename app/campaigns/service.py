@@ -4,8 +4,8 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import Campaign, CampaignMessage, SenderAccount, TargetChat
 from app.campaigns.per_target import sync_next_run
+from app.database.models import Campaign, CampaignMessage, SenderAccount, TargetChat
 
 
 class CampaignValidationError(ValueError):
