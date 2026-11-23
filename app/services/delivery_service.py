@@ -16,6 +16,8 @@ from telethon.errors import (
 )
 
 from app.campaigns.rotation import select_message
+from app.campaigns.per_target import active_links, aware, sync_next_run
+from app.telegram.transport import resolve_peer, forward_original
 from app.campaigns.service import (
     CampaignValidationError,
     calculate_next_run,
@@ -91,8 +93,13 @@ class DeliveryService:
                 await session.commit()
                 return False
             message, next_index = select_message(campaign.messages, campaign.rotation_index)
+            links = {chat.id: link for link, chat in await active_links(session, campaign)}
             targets = [
-                t for t in campaign.targets if t.enabled and t.sender_account_id == account.id
+                t for t in campaign.targets if t.id in links
+                and (
+                    manual or links[t.id].next_run_at is None
+                    or aware(links[t.id].next_run_at) <= now
+                )
             ]
             targets.sort(key=lambda target: target.id)
             stored_cursor = campaign.manual_delivery_cursor if manual else campaign.delivery_cursor
@@ -105,6 +112,11 @@ class DeliveryService:
                         f"sender:{account.id}:connection",
                         f"اتصال حساب {account.label} برای کمپین {campaign.name} برقرار نشد ({type(exc).__name__}).",
                     )
+                # Avoid a tight retry loop when the account is disconnected.
+                if not manual:
+                    for link, _ in await active_links(session, campaign):
+                        if link.next_run_at is None or aware(link.next_run_at) <= now:
+                            link.next_run_at = now + timedelta(minutes=5)
                 await self._finish(session, campaign, token, failed=True, manual=manual)
                 return False
             had_failure = False
@@ -120,20 +132,24 @@ class DeliveryService:
                 )
                 session.add(log)
                 try:
-                    if message.message_type == MessageType.PHOTO:
-                        sent = await client.send_file(
-                            target.telegram_chat_id,
-                            message.media_path,
-                            caption=message.text,
-                            parse_mode=message.parse_mode,
+                    peer = await resolve_peer(client, target.telegram_chat_id)
+                    if message.message_type == MessageType.FORWARD:
+                        sent_id = await forward_original(
+                            client, target.telegram_chat_id,
+                            message.forward_chat_ref, message.forward_message_id
                         )
+                    elif message.message_type == MessageType.PHOTO:
+                        sent = await client.send_file(
+                            peer, message.media_path,
+                            caption=message.text, parse_mode=message.parse_mode,
+                        )
+                        sent_id = sent.id
                     else:
                         sent = await client.send_message(
-                            target.telegram_chat_id,
-                            message.text or "",
-                            parse_mode=message.parse_mode,
+                            peer, message.text or "", parse_mode=message.parse_mode
                         )
-                    log.status, log.telegram_message_id = DeliveryStatus.SUCCESS, sent.id
+                        sent_id = sent.id
+                    log.status, log.telegram_message_id = DeliveryStatus.SUCCESS, sent_id
                 except (FloodWaitError, SlowModeWaitError) as exc:
                     log.status, log.error_type, log.error_message = (
                         DeliveryStatus.RETRY,
@@ -160,6 +176,7 @@ class DeliveryService:
                     ChannelPrivateError,
                     RPCError,
                     OSError,
+                    ValueError,
                 ) as exc:
                     log.error_type, log.error_message, had_failure = (
                         type(exc).__name__,
@@ -167,6 +184,13 @@ class DeliveryService:
                         True,
                     )
                 log.completed_at = datetime.now(UTC)
+                if not manual:
+                    link = links[target.id]
+                    base_due = aware(link.next_run_at) if link.next_run_at else now
+                    link.next_run_at = calculate_next_run(
+                        base_due, link.interval_seconds or campaign.interval_seconds,
+                        datetime.now(UTC)
+                    )
                 await session.commit()
                 if position + 1 < len(targets):
                     await asyncio.sleep(random.uniform(self.min_delay, self.max_delay))
@@ -200,6 +224,8 @@ class DeliveryService:
         campaign.failure_count = campaign.failure_count + 1 if failed else 0
         campaign.last_run_at = now
         if not manual:
-            campaign.next_run_at = calculate_next_run(now, campaign.interval_seconds)
+            await sync_next_run(session, campaign, now=now)
+            if campaign.next_run_at is None:
+                pause_campaign(campaign)
         campaign.execution_token = campaign.execution_started_at = None
         await session.commit()
