@@ -1,9 +1,7 @@
 """Offline regression tests for forum detection, selection and safe topic delivery."""
-from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from telethon import functions, types
 
