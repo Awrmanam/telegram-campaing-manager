@@ -6,6 +6,7 @@ from apscheduler.triggers.date import DateTrigger
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.campaigns.per_target import active_links, aware, sync_next_run
 from app.campaigns.service import calculate_next_run, pause_campaign
 from app.database.models import Campaign
 
@@ -24,13 +25,20 @@ class CampaignScheduler:
                 (await session.scalars(select(Campaign).where(Campaign.enabled.is_(True)))).all()
             )
             for campaign in campaigns:
-                due = campaign.next_run_at or now
-                if due.tzinfo is None:
-                    due = due.replace(tzinfo=UTC)
-                if due <= now and not self.catch_up:
-                    due = calculate_next_run(due, campaign.interval_seconds, now)
-                    campaign.next_run_at = due
-                self.schedule(campaign.id, max(due, now))
+                legacy_due = campaign.next_run_at
+                await sync_next_run(session, campaign, now=now, legacy_due=legacy_due)
+                if not self.catch_up:
+                    for link, _ in await active_links(session, campaign):
+                        due = aware(link.next_run_at)
+                        if due <= now:
+                            link.next_run_at = calculate_next_run(
+                                due, link.interval_seconds or campaign.interval_seconds, now
+                            )
+                    await sync_next_run(session, campaign, now=now)
+                if campaign.next_run_at is None:
+                    pause_campaign(campaign)
+                    continue
+                self.schedule(campaign.id, max(aware(campaign.next_run_at), now))
             await session.commit()
 
     def schedule(self, campaign_id: int, when: datetime) -> None:

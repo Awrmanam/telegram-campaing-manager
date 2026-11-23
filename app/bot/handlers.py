@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import logging
+import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -14,10 +16,10 @@ from telethon.errors import RPCError
 
 from app.bot.keyboards import confirm_keyboard, main_menu, rows_keyboard
 from app.bot.states import CampaignWizard, TextInput
+from app.campaigns.per_target import sync_next_run
 from app.campaigns.service import (
     CampaignValidationError,
     activate_campaign,
-    calculate_next_run,
     disable_sender_account,
     move_campaign_message,
     normalize_message_positions,
@@ -39,22 +41,55 @@ from app.database.models import (
     TargetChat,
 )
 from app.services.media_service import remove_managed_media, replace_message_content
+from app.telegram.transport import forward_original, resolve_peer
+
+logger = logging.getLogger(__name__)
 
 
 def _interval(seconds: int) -> str:
     return f"{seconds // 3600} ساعت" if seconds % 3600 == 0 else f"{seconds // 60} دقیقه"
 
 
-def _message_data(message: Message) -> dict[str, str | None]:
+def _message_data(message: Message) -> dict[str, str | int | None]:
+    """Plain text/photo or a reference to an original channel post/album."""
+    origin = getattr(message, "forward_origin", None)
+    if origin is not None:
+        if getattr(origin, "type", None) == "channel":
+            return {
+                "message_type": "FORWARD",
+                "text": f"فوروارد از {origin.chat.title}، پست #{origin.message_id}",
+                "file_id": None,
+                "forward_chat_ref": str(origin.chat.id),
+                "forward_message_id": origin.message_id,
+            }
+        raise ValueError("این فوروارد شناسه مبدأ ندارد؛ لینک مستقیم پست را بفرستید.")
+    if message.text:
+        value = message.text.strip()
+        match = re.fullmatch(
+            r"(?:https?://)?(?:t\.me|telegram\.me)/(c/)?([A-Za-z0-9_]+)/(\d+)(?:\?.*)?",
+            value,
+        )
+        if match:
+            private, name, mid = match.groups()
+            if private and not name.isdigit():
+                raise ValueError("لینک خصوصی پیام نامعتبر است.")
+            return {
+                "message_type": "FORWARD", "text": f"فوروارد از {value}",
+                "file_id": None,
+                "forward_chat_ref": ("-100" + name if private else "@" + name),
+                "forward_message_id": int(mid),
+            }
+        return {
+            "message_type": "TEXT", "text": message.text, "file_id": None,
+            "forward_chat_ref": None, "forward_message_id": None,
+        }
     if message.photo:
         return {
-            "message_type": "PHOTO",
-            "text": message.caption or "",
+            "message_type": "PHOTO", "text": message.caption or "",
             "file_id": message.photo[-1].file_id,
+            "forward_chat_ref": None, "forward_message_id": None,
         }
-    if message.text:
-        return {"message_type": "TEXT", "text": message.text, "file_id": None}
-    raise ValueError("فقط متن یا تصویر همراه کپشن پذیرفته می‌شود.")
+    raise ValueError("متن، عکس، پست فورواردشده از کانال یا لینک مستقیم پست را بفرستید.")
 
 
 def build_router(
@@ -79,11 +114,31 @@ def build_router(
 
     @router.errors()
     async def operational_error(event: ErrorEvent) -> bool:
+        exc = event.exception
+        logger.error(
+            "panel handler failed: %s", type(exc).__name__,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        callback = event.update.callback_query
+        if callback:
+            try:
+                await callback.answer(
+                    f"❌ {type(exc).__name__}: {(str(exc) or 'خطای ارسال')[:120]}",
+                    show_alert=True,
+                )
+                await callback.message.answer(
+                    f"❌ عملیات انجام نشد: {type(exc).__name__}. لاگ سرور را بررسی کنید."
+                )
+            except Exception:
+                logger.exception("error_feedback_failed")
         if alerts:
-            await alerts.send(
-                f"bot:{type(event.exception).__name__}",
-                f"خطای عملیاتی پنل: {type(event.exception).__name__}",
-            )
+            try:
+                await alerts.send(
+                    f"bot:{type(exc).__name__}",
+                    f"خطای عملیاتی پنل: {type(exc).__name__}",
+                )
+            except Exception:
+                logger.exception("admin_alert_failed")
         return True
 
     async def enabled_accounts():
@@ -270,7 +325,7 @@ def build_router(
             await call.answer("حداقل یک گروه انتخاب کنید", show_alert=True)
             return
         await state.set_state(CampaignWizard.message)
-        await call.message.edit_text("پیام اول کمپین را بفرستید (متن یا تصویر همراه کپشن HTML):")
+        await call.message.edit_text("پیام اول: متن، عکس، فوروارد پست کانال یا لینک مستقیم پست (آلبوم کامل فوروارد می‌شود):")
 
     @router.message(CampaignWizard.message)
     async def wizard_message(message: Message, state: FSMContext) -> None:
@@ -328,6 +383,8 @@ def build_router(
                     message_type=MessageType(item["message_type"]),
                     text=item["text"],
                     media_path=media_path,
+                    forward_chat_ref=item.get("forward_chat_ref"),
+                    forward_message_id=item.get("forward_message_id"),
                 )
             )
             await session.commit()
@@ -455,11 +512,22 @@ def build_router(
         data = await state.get_data()
         async with sessions() as session:
             campaign = await session.get(Campaign, data["campaign_id"])
+            previous = campaign.interval_seconds
             campaign.interval_seconds = seconds
+            # Changing the campaign default only updates targets still using
+            # that default; custom per-group intervals remain untouched.
+            links = list((await session.scalars(
+                select(CampaignTarget).where(CampaignTarget.campaign_id == campaign.id)
+            )).all())
+            for link in links:
+                if link.interval_seconds is None or link.interval_seconds == previous:
+                    link.interval_seconds = seconds
+                    if campaign.enabled:
+                        link.next_run_at = datetime.now(UTC) + timedelta(seconds=seconds)
             if campaign.enabled:
-                campaign.next_run_at = calculate_next_run(datetime.now(UTC), seconds)
+                await sync_next_run(session, campaign)
             await session.commit()
-        if campaign.enabled and scheduler:
+        if campaign.enabled and campaign.next_run_at and scheduler:
             scheduler.schedule(campaign.id, campaign.next_run_at)
         await state.clear()
         await message.answer("✅ فاصله تغییر کرد.")
@@ -555,7 +623,7 @@ def build_router(
         async with sessions() as session:
             item = await session.get(CampaignMessage, mid)
         await call.message.edit_text(
-            f"پیام {item.position}\n\n{item.text or '[تصویر بدون کپشن]'}",
+            f"پیام {item.position} ({item.message_type.value})\n\n{item.text or '[تصویر بدون کپشن]'}",
             reply_markup=rows_keyboard(
                 [
                     ("✏️ ویرایش متن/کپشن", f"msg:edit:{mid}"),
@@ -571,7 +639,7 @@ def build_router(
     async def message_add_prompt(call: CallbackQuery, state: FSMContext) -> None:
         await state.set_state(TextInput.message_add)
         await state.update_data(campaign_id=int(call.data.rsplit(":", 1)[1]))
-        await call.message.answer("پیام جدید (متن یا تصویر+کپشن) را ارسال کنید:")
+        await call.message.answer("پیام جدید: متن، تصویر، فوروارد کانال یا لینک مستقیم پست:")
 
     @router.message(TextInput.message_add)
     async def message_add_save(message: Message, state: FSMContext) -> None:
@@ -594,6 +662,8 @@ def build_router(
                 position=position + 1,
                 message_type=MessageType(item["message_type"]),
                 text=item["text"],
+                forward_chat_ref=item.get("forward_chat_ref"),
+                forward_message_id=item.get("forward_message_id"),
             )
             session.add(row)
             await session.flush()
@@ -609,7 +679,7 @@ def build_router(
     async def message_edit_prompt(call: CallbackQuery, state: FSMContext) -> None:
         await state.set_state(TextInput.message_edit)
         await state.update_data(message_id=int(call.data.rsplit(":", 1)[1]))
-        await call.message.answer("متن/کپشن جدید را وارد کنید:")
+        await call.message.answer("متن، عکس، فوروارد پست یا لینک جدید را ارسال کنید:")
 
     @router.message(TextInput.message_edit)
     async def message_edit_save(message: Message, state: FSMContext) -> None:
@@ -673,24 +743,78 @@ def build_router(
             campaign = await session.scalar(
                 select(Campaign).where(Campaign.id == cid).options(selectinload(Campaign.targets))
             )
-            all_targets = list(
-                (
-                    await session.scalars(
-                        select(TargetChat).where(
-                            TargetChat.sender_account_id == campaign.sender_account_id,
-                            TargetChat.enabled.is_(True),
-                        )
-                    )
-                ).all()
-            )
-        selected = {x.id for x in campaign.targets}
-        rows = [
-            (f"{'✅' if x.id in selected else '⬜'} {x.title}", f"ct:toggle:{cid}:{x.id}")
-            for x in all_targets
-        ]
+            all_targets = list((await session.scalars(
+                select(TargetChat).where(
+                    TargetChat.sender_account_id == campaign.sender_account_id,
+                    TargetChat.enabled.is_(True),
+                )
+            )).all())
+            links = list((await session.scalars(
+                select(CampaignTarget).where(CampaignTarget.campaign_id == cid)
+            )).all())
+        selected = {link.target_chat_id: link for link in links}
+        rows = []
+        for chat in all_targets:
+            rows.append((
+                f"{'✅' if chat.id in selected else '⬜'} {chat.title}",
+                f"ct:toggle:{cid}:{chat.id}",
+            ))
+            if chat.id in selected:
+                interval = selected[chat.id].interval_seconds or campaign.interval_seconds
+                rows.append((
+                    f"⏱ {chat.title}: {_interval(interval)}",
+                    f"ct:interval:{cid}:{chat.id}",
+                ))
         await call.message.edit_text(
-            "گروه‌ها را اضافه/حذف کنید:", reply_markup=rows_keyboard(rows, back=f"camp:view:{cid}")
+            "گروه‌های کمپین را فعال/حذف کنید؛ فاصله هر گروه مستقل قابل تغییر است:",
+            reply_markup=rows_keyboard(rows, back=f"camp:view:{cid}"),
         )
+
+    @router.callback_query(F.data.startswith("ct:interval:"))
+    async def target_interval_prompt(call: CallbackQuery, state: FSMContext) -> None:
+        _, _, cid, tid = call.data.split(":")
+        async with sessions() as session:
+            link = await session.get(
+                CampaignTarget, {"campaign_id": int(cid), "target_chat_id": int(tid)}
+            )
+            if not link:
+                await call.answer("این گروه در کمپین ثبت نشده.", show_alert=True)
+                return
+        await state.set_state(TextInput.target_interval)
+        await state.update_data(interval_campaign=int(cid), interval_target=int(tid))
+        await call.message.answer(
+            "فاصله اختصاصی این گروه را وارد کنید (مثلاً 6h یا 24h). "
+            "حداقل ۵ دقیقه و حداکثر ۳۰ روز:"
+        )
+        await call.answer()
+
+    @router.message(TextInput.target_interval)
+    async def target_interval_save(message: Message, state: FSMContext) -> None:
+        try:
+            seconds = parse_interval(message.text or "")
+        except ValueError as exc:
+            await message.answer(str(exc))
+            return
+        data = await state.get_data()
+        async with sessions() as session:
+            cid, tid = data["interval_campaign"], data["interval_target"]
+            link = await session.get(
+                CampaignTarget, {"campaign_id": cid, "target_chat_id": tid}
+            )
+            campaign = await session.get(Campaign, cid)
+            if not link or not campaign:
+                await message.answer("این گروه/کمپین دیگر وجود ندارد.")
+                await state.clear()
+                return
+            link.interval_seconds = seconds
+            link.next_run_at = datetime.now(UTC) + timedelta(seconds=seconds)
+            if campaign.enabled:
+                await sync_next_run(session, campaign)
+            await session.commit()
+        if campaign.enabled and campaign.next_run_at and scheduler:
+            scheduler.schedule(cid, campaign.next_run_at)
+        await state.clear()
+        await message.answer(f"✅ فاصله اختصاصی گروه ثبت شد: {_interval(seconds)}")
 
     @router.callback_query(F.data.startswith("ct:toggle:"))
     async def campaign_target_toggle(call: CallbackQuery) -> None:
@@ -700,8 +824,9 @@ def build_router(
                 await session.get(Campaign, int(cid)),
                 await session.get(TargetChat, int(tid)),
             )
-            if target.sender_account_id != campaign.sender_account_id:
-                await call.answer("حساب گروه ناسازگار است", show_alert=True)
+            if not campaign or not target or not target.enabled \
+                    or target.sender_account_id != campaign.sender_account_id:
+                await call.answer("حساب یا گروه مجاز نیست", show_alert=True)
                 return
             row = await session.get(
                 CampaignTarget, {"campaign_id": int(cid), "target_chat_id": int(tid)}
@@ -711,15 +836,28 @@ def build_router(
                 await session.flush()
                 paused = await pause_if_no_enabled_targets(session, campaign)
             else:
-                session.add(CampaignTarget(campaign_id=int(cid), target_chat_id=int(tid)))
+                session.add(CampaignTarget(
+                    campaign_id=int(cid), target_chat_id=int(tid),
+                    interval_seconds=campaign.interval_seconds,
+                    next_run_at=datetime.now(UTC) + timedelta(
+                        seconds=campaign.interval_seconds
+                    ),
+                ))
+                await session.flush()
                 paused = False
+            if campaign.enabled and not paused:
+                await sync_next_run(session, campaign)
             await session.commit()
-        if paused and scheduler:
-            scheduler.cancel(int(cid))
+        if scheduler:
+            if paused:
+                scheduler.cancel(int(cid))
+            elif campaign.enabled and campaign.next_run_at:
+                scheduler.schedule(int(cid), campaign.next_run_at)
         await call.answer(
-            "آخرین گروه حذف و کمپین خودکار متوقف شد." if paused else "ذخیره شد",
+            "آخرین گروه حذف و کمپین متوقف شد." if paused else "ذخیره شد",
             show_alert=paused,
         )
+        await campaign_targets(call)
 
     # Account management
     @router.message(F.text == "👤 حساب‌های ارسال")
@@ -1068,7 +1206,7 @@ def build_router(
     async def test_target(call: CallbackQuery, state: FSMContext) -> None:
         await state.update_data(test_target_id=int(call.data.rsplit(":", 1)[1]))
         await state.set_state(TextInput.test_message)
-        await call.message.edit_text("پیام آزمایشی (متن یا تصویر+کپشن):")
+        await call.message.edit_text("پیام آزمایشی: متن، تصویر، فوروارد کانال یا لینک مستقیم پست:")
 
     @router.message(TextInput.test_message)
     async def test_preview(message: Message, state: FSMContext) -> None:
@@ -1095,35 +1233,56 @@ def build_router(
 
     @router.callback_query(TextInput.test_preview, F.data == "test:send")
     async def test_send(call: CallbackQuery, state: FSMContext) -> None:
+        await call.answer("⏳ در حال بررسی ارسال...")
         data = await state.get_data()
-        async with sessions() as session:
-            account, target = (
-                await session.get(SenderAccount, data["test_sender_id"]),
-                await session.get(TargetChat, data["test_target_id"]),
-            )
-            if not account.enabled or not target.enabled or target.sender_account_id != account.id:
-                await call.answer("حساب یا گروه دیگر مجاز نیست", show_alert=True)
-                return
-            client = await chat_service.clients.get(account)
-            item = data["test_item"]
-            if item["message_type"] == "PHOTO":
-                media_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-                temporary = media_directory / f"test_{call.from_user.id}_{call.id}.jpg"
-                try:
-                    await call.bot.download(item["file_id"], destination=temporary)
-                    await client.send_file(
-                        target.telegram_chat_id,
-                        str(temporary),
-                        caption=item["text"],
-                        parse_mode="HTML",
+        try:
+            async with sessions() as session:
+                account, target = (
+                    await session.get(SenderAccount, data["test_sender_id"]),
+                    await session.get(TargetChat, data["test_target_id"]),
+                )
+                if not account or not target or not account.enabled or not target.enabled \
+                        or target.sender_account_id != account.id:
+                    await call.message.answer("❌ حساب یا گروه مجاز نیست.")
+                    return
+                client = await chat_service.clients.get(account)
+                item = data["test_item"]
+                peer = await resolve_peer(client, target.telegram_chat_id)
+                if item["message_type"] == "FORWARD":
+                    await forward_original(
+                        client, target.telegram_chat_id,
+                        item["forward_chat_ref"], item["forward_message_id"],
                     )
-                finally:
-                    temporary.unlink(missing_ok=True)
-            else:
-                await client.send_message(target.telegram_chat_id, item["text"], parse_mode="HTML")
+                elif item["message_type"] == "PHOTO":
+                    media_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    temporary = media_directory / f"test_{call.from_user.id}_{call.id}.jpg"
+                    try:
+                        await call.bot.download(item["file_id"], destination=temporary)
+                        await client.send_file(
+                            peer, str(temporary), caption=item["text"], parse_mode=None,
+                        )
+                    finally:
+                        temporary.unlink(missing_ok=True)
+                else:
+                    await client.send_message(peer, item["text"], parse_mode=None)
+        except Exception as exc:
+            logger.exception("test_delivery_failed")
+            await call.message.answer(
+                f"❌ ارسال انجام نشد: {type(exc).__name__}\n"
+                f"{str(exc)[:250]}\n"
+                "عضویت اکانت در گروه، اجازه ارسال و دسترسی به پست مبدأ را بررسی کنید."
+            )
+            return
         await state.clear()
         await call.message.edit_reply_markup()
-        await call.message.answer("✅ ارسال آزمایشی انجام شد؛ زمان‌بندی و rotation تغییر نکرد.")
+        await call.message.answer("✅ ارسال آزمایشی موفق بود؛ زمان‌بندی تغییر نکرد.")
+
+    @router.callback_query(F.data == "test:send")
+    async def expired_test_confirmation(call: CallbackQuery) -> None:
+        await call.answer(
+            "تأیید قدیمی منقضی شده؛ از /start ارسال آزمایشی جدید بسازید.",
+            show_alert=True,
+        )
 
     @router.message(F.text == "📊 گزارش‌ها")
     async def reports(message: Message) -> None:

@@ -16,6 +16,7 @@ class Base(DeclarativeBase):
 class MessageType(str, enum.Enum):
     TEXT = "TEXT"
     PHOTO = "PHOTO"
+    FORWARD = "FORWARD"
 
 
 class DeliveryStatus(str, enum.Enum):
@@ -86,6 +87,8 @@ class Campaign(Base):
 
 class CampaignTarget(Base):
     __tablename__ = "campaign_targets"
+    interval_seconds: Mapped[int | None] = mapped_column(nullable=True)
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     campaign_id: Mapped[int] = mapped_column(
         ForeignKey("campaigns.id", ondelete="CASCADE"), primary_key=True
     )
@@ -106,6 +109,8 @@ class CampaignMessage(Base):
     text: Mapped[str | None] = mapped_column(Text)
     parse_mode: Mapped[str] = mapped_column(String(20), default="HTML")
     media_path: Mapped[str | None] = mapped_column(String(500))
+    forward_chat_ref: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    forward_message_id: Mapped[int | None] = mapped_column(nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 

@@ -14,6 +14,7 @@ class CampaignWizard(StatesGroup):
 class TextInput(StatesGroup):
     campaign_rename = State()
     campaign_interval = State()
+    target_interval = State()
     message_add = State()
     message_edit = State()
     test_message = State()

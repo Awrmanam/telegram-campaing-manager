@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.campaigns.per_target import sync_next_run
 from app.database.models import Campaign, CampaignMessage, SenderAccount, TargetChat
 
 
@@ -36,7 +37,7 @@ async def activate_campaign(
     await validate_campaign_ready(session, campaign)
     campaign.enabled = True
     base = now or datetime.now(UTC)
-    campaign.next_run_at = calculate_next_run(base, campaign.interval_seconds, base)
+    await sync_next_run(session, campaign, reset=True, now=base)
 
 
 def pause_campaign(campaign: Campaign) -> None:
