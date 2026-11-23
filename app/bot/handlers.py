@@ -1450,9 +1450,58 @@ def build_router(
 
     @router.callback_query(F.data.startswith("test:target:"))
     async def test_target(call: CallbackQuery, state: FSMContext) -> None:
-        await state.update_data(test_target_id=int(call.data.rsplit(":", 1)[1]))
+        tid = int(call.data.rsplit(":", 1)[1])
+        async with sessions() as session:
+            target = await session.get(TargetChat, tid)
+        await state.update_data(test_target_id=tid, test_topic_id=None)
+        if not target or not target.enabled:
+            await call.answer("گروه غیرفعال یا حذف شده است.", show_alert=True)
+            return
+        if target.is_forum:
+            topics = await fetch_target_topics(target)
+            if not topics:
+                await call.answer("تاپیک باز و قابل دسترسی پیدا نشد.", show_alert=True)
+                return
+            await state.update_data(test_topic_options=topics)
+            await state.set_state(TextInput.test_topic)
+            await call.message.edit_text(
+                f"🧵 گروه «{target.title}» تاپیک‌دار است؛ تاپیک ارسال آزمایشی را انتخاب کن:",
+                reply_markup=topic_keyboard(topics, 0, "test:topic"),
+            )
+        else:
+            await state.set_state(TextInput.test_message)
+            await call.message.edit_text(
+                "پیام آزمایشی: متن، تصویر، فوروارد کانال یا لینک مستقیم پست:"
+            )
+        await call.answer()
+
+    @router.callback_query(TextInput.test_topic, F.data.startswith("test:topic:page:"))
+    async def test_topic_page(call: CallbackQuery, state: FSMContext) -> None:
+        page = int(call.data.rsplit(":", 1)[1])
+        data = await state.get_data()
+        await call.message.edit_reply_markup(
+            reply_markup=topic_keyboard(data["test_topic_options"], page, "test:topic")
+        )
+        await call.answer()
+
+    @router.callback_query(TextInput.test_topic, F.data.startswith("test:topic:pick:"))
+    async def test_topic_pick(call: CallbackQuery, state: FSMContext) -> None:
+        tid = int(call.data.rsplit(":", 1)[1])
+        data = await state.get_data()
+        async with sessions() as session:
+            target = await session.get(TargetChat, data["test_target_id"])
+        live = await fetch_target_topics(target)
+        topic = next((x for x in live if x["id"] == tid), None)
+        if not topic:
+            await call.answer("تاپیک حذف یا بسته شده است.", show_alert=True)
+            return
+        await state.update_data(test_topic_id=tid, test_topic_title=topic["title"])
         await state.set_state(TextInput.test_message)
-        await call.message.edit_text("پیام آزمایشی: متن، تصویر، فوروارد کانال یا لینک مستقیم پست:")
+        await call.message.edit_text(
+            f"✅ تاپیک مقصد: {topic['title']}\n"
+            "پیام آزمایشی (متن، عکس، فوروارد یا لینک پست) را ارسال کن:"
+        )
+        await call.answer()
 
     @router.message(TextInput.test_message)
     async def test_preview(message: Message, state: FSMContext) -> None:
@@ -1493,11 +1542,18 @@ def build_router(
                     return
                 client = await chat_service.clients.get(account)
                 item = data["test_item"]
+                topic_id = data.get("test_topic_id")
+                if target.is_forum and topic_id is None:
+                    raise ValueError("برای ارسال به گروه Forum باید تاپیک انتخاب شود.")
+                if not target.is_forum and topic_id is not None:
+                    raise ValueError("این گروه تاپیک ندارد.")
                 peer = await resolve_peer(client, target.telegram_chat_id)
+                reply_to = topic_id if topic_id and topic_id != 1 else None
                 if item["message_type"] == "FORWARD":
                     await forward_original(
                         client, target.telegram_chat_id,
                         item["forward_chat_ref"], item["forward_message_id"],
+                        topic_id=topic_id,
                     )
                 elif item["message_type"] == "PHOTO":
                     media_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1506,11 +1562,14 @@ def build_router(
                         await call.bot.download(item["file_id"], destination=temporary)
                         await client.send_file(
                             peer, str(temporary), caption=item["text"], parse_mode=None,
+                            reply_to=reply_to,
                         )
                     finally:
                         temporary.unlink(missing_ok=True)
                 else:
-                    await client.send_message(peer, item["text"], parse_mode=None)
+                    await client.send_message(
+                        peer, item["text"], parse_mode=None, reply_to=reply_to
+                    )
         except Exception as exc:
             logger.exception("test_delivery_failed")
             await call.message.answer(
@@ -1521,7 +1580,11 @@ def build_router(
             return
         await state.clear()
         await call.message.edit_reply_markup()
-        await call.message.answer("✅ ارسال آزمایشی موفق بود؛ زمان‌بندی تغییر نکرد.")
+        await call.message.answer(
+            "✅ ارسال آزمایشی موفق بود"
+            + (f"؛ تاپیک: {data.get('test_topic_title')}" if data.get("test_topic_id") else "")
+            + ". زمان‌بندی تغییر نکرد."
+        )
 
     @router.callback_query(F.data == "test:send")
     async def expired_test_confirmation(call: CallbackQuery) -> None:
