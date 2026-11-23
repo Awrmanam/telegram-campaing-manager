@@ -19,6 +19,13 @@ async def replace_message_content(
     """Replace message content atomically and remove media that is no longer referenced."""
     old_path = Path(message.media_path) if message.media_path else None
     message.text = replacement["text"]
+    message.forward_chat_ref = replacement.get("forward_chat_ref")
+    message.forward_message_id = replacement.get("forward_message_id")
+    if replacement["message_type"] == "FORWARD":
+        message.message_type = MessageType.FORWARD
+        message.media_path = None
+        remove_managed_media(old_path, media_directory)
+        return
     if replacement["message_type"] == "TEXT":
         message.message_type = MessageType.TEXT
         message.media_path = None
