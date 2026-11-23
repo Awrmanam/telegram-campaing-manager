@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 import logging
 import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -16,10 +16,10 @@ from telethon.errors import RPCError
 
 from app.bot.keyboards import confirm_keyboard, main_menu, rows_keyboard
 from app.bot.states import CampaignWizard, TextInput
+from app.campaigns.per_target import sync_next_run
 from app.campaigns.service import (
     CampaignValidationError,
     activate_campaign,
-    calculate_next_run,
     disable_sender_account,
     move_campaign_message,
     normalize_message_positions,
@@ -41,8 +41,7 @@ from app.database.models import (
     TargetChat,
 )
 from app.services.media_service import remove_managed_media, replace_message_content
-from app.campaigns.per_target import sync_next_run
-from app.telegram.transport import resolve_peer, forward_original
+from app.telegram.transport import forward_original, resolve_peer
 
 logger = logging.getLogger(__name__)
 
