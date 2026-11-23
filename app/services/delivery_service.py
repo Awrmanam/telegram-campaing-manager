@@ -15,9 +15,8 @@ from telethon.errors import (
     UserBannedInChannelError,
 )
 
-from app.campaigns.rotation import select_message
 from app.campaigns.per_target import active_links, aware, sync_next_run
-from app.telegram.transport import resolve_peer, forward_original
+from app.campaigns.rotation import select_message
 from app.campaigns.service import (
     CampaignValidationError,
     calculate_next_run,
@@ -26,6 +25,7 @@ from app.campaigns.service import (
 )
 from app.database.models import Campaign, DeliveryLog, DeliveryStatus, MessageType, SenderAccount
 from app.telegram.client_manager import ClientManager
+from app.telegram.transport import forward_original, resolve_peer
 
 logger = logging.getLogger(__name__)
 
