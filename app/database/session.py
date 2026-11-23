@@ -26,3 +26,27 @@ def create_database(url: str) -> tuple[AsyncEngine, async_sessionmaker]:
 async def initialize_database(engine: AsyncEngine) -> None:
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        # Additive SQLite upgrade for already deployed installations. create_all()
+        # does not add columns to existing tables; preserve DB and sessions.
+        if engine.url.get_backend_name() == "sqlite":
+            upgrades = {
+                "campaign_targets": {
+                    "interval_seconds": "INTEGER",
+                    "next_run_at": "DATETIME",
+                },
+                "campaign_messages": {
+                    "forward_chat_ref": "VARCHAR(200)",
+                    "forward_message_id": "INTEGER",
+                },
+            }
+            for table, columns in upgrades.items():
+                existing = {
+                    row[1] for row in (
+                        await connection.exec_driver_sql(f"PRAGMA table_info({table})")
+                    ).all()
+                }
+                for name, sql_type in columns.items():
+                    if name not in existing:
+                        await connection.exec_driver_sql(
+                            f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}"
+                        )
