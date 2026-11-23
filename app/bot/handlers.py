@@ -1624,7 +1624,7 @@ def build_router(
             logger.exception("test_delivery_failed")
             await call.message.answer(
                 f"❌ ارسال انجام نشد: {type(exc).__name__}\n"
-                f"{str(exc)[:250]}\n"
+                f"{str(exc)[:650]}\n"
                 "عضویت اکانت در گروه، اجازه ارسال و دسترسی به پست مبدأ را بررسی کنید."
             )
             return
