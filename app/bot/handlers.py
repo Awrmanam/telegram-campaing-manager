@@ -41,7 +41,7 @@ from app.database.models import (
     TargetChat,
 )
 from app.services.media_service import remove_managed_media, replace_message_content
-from app.telegram.topics import list_forum_topics
+from app.telegram.topics import list_forum_topics, select_forum_topic
 from app.telegram.transport import forward_original, resolve_peer
 
 logger = logging.getLogger(__name__)
@@ -873,6 +873,12 @@ def build_router(
                 f"ct:toggle:{cid}:{chat.id}",
             ))
             if chat.id in selected:
+                if chat.is_forum:
+                    rows.append((
+                        f"🧵 مقصد {chat.title}: "
+                        f"{selected[chat.id].topic_title or '⚠️ انتخاب نشده'}",
+                        f"ct:topic:{cid}:{chat.id}:0",
+                    ))
                 interval = selected[chat.id].interval_seconds or campaign.interval_seconds
                 rows.append((
                     f"⏱ {chat.title}: {_interval(interval)}",
@@ -881,6 +887,97 @@ def build_router(
         await call.message.edit_text(
             "گروه‌های کمپین را فعال/حذف کنید؛ فاصله هر گروه مستقل قابل تغییر است:",
             reply_markup=rows_keyboard(rows, back=f"camp:view:{cid}"),
+        )
+
+    @router.callback_query(F.data.startswith("ct:topic:"))
+    async def campaign_topic_chooser(call: CallbackQuery) -> None:
+        _, _, cid, tid, page = call.data.split(":")
+        async with sessions() as session:
+            link = await session.get(
+                CampaignTarget, {"campaign_id": int(cid), "target_chat_id": int(tid)}
+            )
+            target = await session.get(TargetChat, int(tid))
+        if not link or not target or not target.enabled or not target.is_forum:
+            await call.answer("گروه Forum به این کمپین متصل نیست.", show_alert=True)
+            return
+        topics = await fetch_target_topics(target)
+        if not topics:
+            await call.answer("تاپیک قابل انتخابی پیدا نشد.", show_alert=True)
+            return
+        current = max(0, int(page))
+        rows = [
+            (f"{'✅' if t['id'] == link.topic_id else '🧵'} {t['title'][:48]}",
+             f"ct:settopic:{cid}:{tid}:{t['id']}")
+            for t in topics[current * 8:(current + 1) * 8]
+        ]
+        if current:
+            rows.append(("⬅️ قبلی", f"ct:topic:{cid}:{tid}:{current - 1}"))
+        if (current + 1) * 8 < len(topics):
+            rows.append(("بعدی ➡️", f"ct:topic:{cid}:{tid}:{current + 1}"))
+        await call.message.edit_text(
+            f"🧵 گروه «{target.title}»: تاپیک مقصد را انتخاب کن.\n"
+            f"تاپیک کنونی: {link.topic_title or 'انتخاب نشده'}",
+            reply_markup=rows_keyboard(rows, back=f"ct:list:{cid}"),
+        )
+        await call.answer()
+
+    @router.callback_query(F.data.startswith("ct:settopic:"))
+    async def campaign_topic_save(call: CallbackQuery) -> None:
+        _, _, cid, tid, topic_id = call.data.split(":")
+        cid, tid, topic_id = int(cid), int(tid), int(topic_id)
+        async with sessions() as session:
+            campaign = await session.get(Campaign, cid)
+            link = await session.get(
+                CampaignTarget, {"campaign_id": cid, "target_chat_id": tid}
+            )
+            target = await session.get(TargetChat, tid)
+            if not campaign or not link or not target or not target.is_forum \
+                    or not target.enabled or campaign.sender_account_id != target.sender_account_id:
+                await call.answer("کمپین یا گروه معتبر نیست.", show_alert=True)
+                return
+        async with sessions() as session:
+            account = await session.get(SenderAccount, target.sender_account_id)
+        client = await chat_service.clients.get(account)
+        choice = await select_forum_topic(client, target.telegram_chat_id, topic_id)
+        async with sessions() as session:
+            campaign = await session.get(Campaign, cid)
+            link = await session.get(
+                CampaignTarget, {"campaign_id": cid, "target_chat_id": tid}
+            )
+            if not link or not campaign:
+                await call.answer("گروه از کمپین حذف شده است.", show_alert=True)
+                return
+            link.topic_id, link.topic_title = choice.id, choice.title
+            if campaign.enabled:
+                link.next_run_at = datetime.now(UTC) + timedelta(
+                    seconds=link.interval_seconds or campaign.interval_seconds
+                )
+                await sync_next_run(session, campaign)
+            await session.commit()
+        if campaign.enabled and campaign.next_run_at and scheduler:
+            scheduler.schedule(cid, campaign.next_run_at)
+        await call.message.edit_text(
+            f"✅ تاپیک «{choice.title}» به‌عنوان مقصد گروه ثبت شد.",
+            reply_markup=rows_keyboard([], back=f"ct:list:{cid}"),
+        )
+        await call.answer()
+
+    async def campaign_topic_chooser_from_add(
+        call: CallbackQuery, cid: int, tid: int
+    ) -> None:
+        async with sessions() as session:
+            target = await session.get(TargetChat, tid)
+        topics = await fetch_target_topics(target)
+        rows = [
+            (f"🧵 {topic['title'][:48]}", f"ct:settopic:{cid}:{tid}:{topic['id']}")
+            for topic in topics[:8]
+        ]
+        if len(topics) > 8:
+            rows.append(("بعدی ➡️", f"ct:topic:{cid}:{tid}:1"))
+        await call.message.edit_text(
+            f"🧵 گروه «{target.title}» تاپیک‌دار است؛ "
+            "تاپیک مقصد این کمپین را مشخص کن:",
+            reply_markup=rows_keyboard(rows, back=f"ct:list:{cid}"),
         )
 
     @router.callback_query(F.data.startswith("ct:interval:"))
@@ -970,7 +1067,10 @@ def build_router(
             "آخرین گروه حذف و کمپین متوقف شد." if paused else "ذخیره شد",
             show_alert=paused,
         )
-        await campaign_targets(call)
+        if not row and target.is_forum:
+            await campaign_topic_chooser_from_add(call, int(cid), int(tid))
+        else:
+            await campaign_targets(call)
 
     # Account management
     @router.message(F.text == "👤 حساب‌های ارسال")
