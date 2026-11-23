@@ -6,8 +6,8 @@ from apscheduler.triggers.date import DateTrigger
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.campaigns.service import calculate_next_run, pause_campaign
 from app.campaigns.per_target import active_links, aware, sync_next_run
+from app.campaigns.service import calculate_next_run, pause_campaign
 from app.database.models import Campaign
 
 logger = logging.getLogger(__name__)
