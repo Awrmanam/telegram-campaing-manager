@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from telethon import functions, types
+from telethon.errors import PeerIdInvalidError
 
 from app.bot.handlers import build_router
 from app.campaigns.service import CampaignValidationError, validate_campaign_ready
@@ -204,3 +205,53 @@ async def test_additive_sqlite_migration_preserves_existing_target_rows():
         )).one()
         assert row == ("Existing", 0)
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_invalid_peer_forward_keeps_topic_safe_and_explains_error():
+    calls = []
+
+    class Client:
+        async def iter_dialogs(self):
+            yield SimpleNamespace(id=-10042, input_entity="forum-peer")
+
+        async def get_input_entity(self, ref):
+            return "source-peer"
+
+        async def get_messages(self, peer, ids):
+            assert peer == "source-peer"
+            return SimpleNamespace(id=50, grouped_id=None)
+
+        async def __call__(self, request):
+            calls.append(request)
+            raise PeerIdInvalidError(request=None)
+
+        async def forward_messages(self, *args, **kwargs):
+            raise AssertionError("Must not retry into General topic!")
+
+    with pytest.raises(ValueError, match="PEER_ID_INVALID"):
+        await forward_original(
+            Client(), -10042, "@channel", 50, topic_id=100
+        )
+    assert len(calls) == 1
+    assert calls[0].top_msg_id == 100
+
+
+@pytest.mark.asyncio
+async def test_failed_manual_delivery_does_not_report_success(sessions):
+    campaign_id = await forum_campaign(sessions, selected_topic=100)
+
+    class Client:
+        async def iter_dialogs(self):
+            yield SimpleNamespace(id=-10042, input_entity="forum-peer")
+
+        async def send_message(self, entity, text, **kwargs):
+            raise PeerIdInvalidError(request=None)
+
+    class Clients:
+        async def get(self, account):
+            return Client()
+
+    assert not await DeliveryService(sessions, Clients(), 0, 0).execute(
+        campaign_id, manual=True,
+    )
