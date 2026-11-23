@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import logging
+import re
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -39,22 +41,56 @@ from app.database.models import (
     TargetChat,
 )
 from app.services.media_service import remove_managed_media, replace_message_content
+from app.campaigns.per_target import sync_next_run
+from app.telegram.transport import resolve_peer, forward_original
+
+logger = logging.getLogger(__name__)
 
 
 def _interval(seconds: int) -> str:
     return f"{seconds // 3600} ساعت" if seconds % 3600 == 0 else f"{seconds // 60} دقیقه"
 
 
-def _message_data(message: Message) -> dict[str, str | None]:
+def _message_data(message: Message) -> dict[str, str | int | None]:
+    """Plain text/photo or a reference to an original channel post/album."""
+    origin = getattr(message, "forward_origin", None)
+    if origin is not None:
+        if getattr(origin, "type", None) == "channel":
+            return {
+                "message_type": "FORWARD",
+                "text": f"فوروارد از {origin.chat.title}، پست #{origin.message_id}",
+                "file_id": None,
+                "forward_chat_ref": str(origin.chat.id),
+                "forward_message_id": origin.message_id,
+            }
+        raise ValueError("این فوروارد شناسه مبدأ ندارد؛ لینک مستقیم پست را بفرستید.")
+    if message.text:
+        value = message.text.strip()
+        match = re.fullmatch(
+            r"(?:https?://)?(?:t\.me|telegram\.me)/(c/)?([A-Za-z0-9_]+)/(\d+)(?:\?.*)?",
+            value,
+        )
+        if match:
+            private, name, mid = match.groups()
+            if private and not name.isdigit():
+                raise ValueError("لینک خصوصی پیام نامعتبر است.")
+            return {
+                "message_type": "FORWARD", "text": f"فوروارد از {value}",
+                "file_id": None,
+                "forward_chat_ref": ("-100" + name if private else "@" + name),
+                "forward_message_id": int(mid),
+            }
+        return {
+            "message_type": "TEXT", "text": message.text, "file_id": None,
+            "forward_chat_ref": None, "forward_message_id": None,
+        }
     if message.photo:
         return {
-            "message_type": "PHOTO",
-            "text": message.caption or "",
+            "message_type": "PHOTO", "text": message.caption or "",
             "file_id": message.photo[-1].file_id,
+            "forward_chat_ref": None, "forward_message_id": None,
         }
-    if message.text:
-        return {"message_type": "TEXT", "text": message.text, "file_id": None}
-    raise ValueError("فقط متن یا تصویر همراه کپشن پذیرفته می‌شود.")
+    raise ValueError("متن، عکس، پست فورواردشده از کانال یا لینک مستقیم پست را بفرستید.")
 
 
 def build_router(
@@ -79,11 +115,31 @@ def build_router(
 
     @router.errors()
     async def operational_error(event: ErrorEvent) -> bool:
+        exc = event.exception
+        logger.error(
+            "panel handler failed: %s", type(exc).__name__,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        callback = event.update.callback_query
+        if callback:
+            try:
+                await callback.answer(
+                    f"❌ {type(exc).__name__}: {(str(exc) or 'خطای ارسال')[:120]}",
+                    show_alert=True,
+                )
+                await callback.message.answer(
+                    f"❌ عملیات انجام نشد: {type(exc).__name__}. لاگ سرور را بررسی کنید."
+                )
+            except Exception:
+                logger.exception("error_feedback_failed")
         if alerts:
-            await alerts.send(
-                f"bot:{type(event.exception).__name__}",
-                f"خطای عملیاتی پنل: {type(event.exception).__name__}",
-            )
+            try:
+                await alerts.send(
+                    f"bot:{type(exc).__name__}",
+                    f"خطای عملیاتی پنل: {type(exc).__name__}",
+                )
+            except Exception:
+                logger.exception("admin_alert_failed")
         return True
 
     async def enabled_accounts():
@@ -270,7 +326,7 @@ def build_router(
             await call.answer("حداقل یک گروه انتخاب کنید", show_alert=True)
             return
         await state.set_state(CampaignWizard.message)
-        await call.message.edit_text("پیام اول کمپین را بفرستید (متن یا تصویر همراه کپشن HTML):")
+        await call.message.edit_text("پیام اول: متن، عکس، فوروارد پست کانال یا لینک مستقیم پست (آلبوم کامل فوروارد می‌شود):")
 
     @router.message(CampaignWizard.message)
     async def wizard_message(message: Message, state: FSMContext) -> None:
@@ -328,6 +384,8 @@ def build_router(
                     message_type=MessageType(item["message_type"]),
                     text=item["text"],
                     media_path=media_path,
+                    forward_chat_ref=item.get("forward_chat_ref"),
+                    forward_message_id=item.get("forward_message_id"),
                 )
             )
             await session.commit()
@@ -555,7 +613,7 @@ def build_router(
         async with sessions() as session:
             item = await session.get(CampaignMessage, mid)
         await call.message.edit_text(
-            f"پیام {item.position}\n\n{item.text or '[تصویر بدون کپشن]'}",
+            f"پیام {item.position} ({item.message_type.value})\n\n{item.text or '[تصویر بدون کپشن]'}",
             reply_markup=rows_keyboard(
                 [
                     ("✏️ ویرایش متن/کپشن", f"msg:edit:{mid}"),
@@ -571,7 +629,7 @@ def build_router(
     async def message_add_prompt(call: CallbackQuery, state: FSMContext) -> None:
         await state.set_state(TextInput.message_add)
         await state.update_data(campaign_id=int(call.data.rsplit(":", 1)[1]))
-        await call.message.answer("پیام جدید (متن یا تصویر+کپشن) را ارسال کنید:")
+        await call.message.answer("پیام جدید: متن، تصویر، فوروارد کانال یا لینک مستقیم پست:")
 
     @router.message(TextInput.message_add)
     async def message_add_save(message: Message, state: FSMContext) -> None:
@@ -594,6 +652,8 @@ def build_router(
                 position=position + 1,
                 message_type=MessageType(item["message_type"]),
                 text=item["text"],
+                forward_chat_ref=item.get("forward_chat_ref"),
+                forward_message_id=item.get("forward_message_id"),
             )
             session.add(row)
             await session.flush()
@@ -609,7 +669,7 @@ def build_router(
     async def message_edit_prompt(call: CallbackQuery, state: FSMContext) -> None:
         await state.set_state(TextInput.message_edit)
         await state.update_data(message_id=int(call.data.rsplit(":", 1)[1]))
-        await call.message.answer("متن/کپشن جدید را وارد کنید:")
+        await call.message.answer("متن، عکس، فوروارد پست یا لینک جدید را ارسال کنید:")
 
     @router.message(TextInput.message_edit)
     async def message_edit_save(message: Message, state: FSMContext) -> None:
@@ -1068,7 +1128,7 @@ def build_router(
     async def test_target(call: CallbackQuery, state: FSMContext) -> None:
         await state.update_data(test_target_id=int(call.data.rsplit(":", 1)[1]))
         await state.set_state(TextInput.test_message)
-        await call.message.edit_text("پیام آزمایشی (متن یا تصویر+کپشن):")
+        await call.message.edit_text("پیام آزمایشی: متن، تصویر، فوروارد کانال یا لینک مستقیم پست:")
 
     @router.message(TextInput.test_message)
     async def test_preview(message: Message, state: FSMContext) -> None:
