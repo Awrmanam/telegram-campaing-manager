@@ -9,7 +9,13 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.campaigns.per_target import active_links, aware
 from app.campaigns.service import activate_campaign
 from app.database.models import (
-    Base, Campaign, CampaignMessage, CampaignTarget, MessageType, SenderAccount, TargetChat,
+    Base,
+    Campaign,
+    CampaignMessage,
+    CampaignTarget,
+    MessageType,
+    SenderAccount,
+    TargetChat,
 )
 from app.telegram.transport import forward_original, resolve_peer
 
