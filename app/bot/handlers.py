@@ -174,6 +174,44 @@ def build_router(
         found = await list_forum_topics(client, target.telegram_chat_id)
         return [{"id": topic.id, "title": topic.title} for topic in found]
 
+    async def refresh_registered_forums(sender_id: int, found=None) -> None:
+        """Refresh Forum flags for older group registrations without adding any groups."""
+        if chat_service is None:
+            return
+        if found is None:
+            async with sessions() as session:
+                account = await session.get(SenderAccount, sender_id)
+            if account is None or not account.enabled:
+                return
+            found = await chat_service.list_accessible(account)
+        actual_by_id = {item.telegram_chat_id: item for item in found}
+        paused_ids = []
+        async with sessions() as session:
+            registered = list((await session.scalars(
+                select(TargetChat).where(TargetChat.sender_account_id == sender_id)
+            )).all())
+            for target in registered:
+                actual = actual_by_id.get(target.telegram_chat_id)
+                if actual is None or target.is_forum == actual.is_forum:
+                    continue
+                target.is_forum = actual.is_forum
+                if actual.is_forum:
+                    links = list((await session.scalars(
+                        select(CampaignTarget).where(
+                            CampaignTarget.target_chat_id == target.id,
+                            CampaignTarget.topic_id.is_(None),
+                        )
+                    )).all())
+                    for link in links:
+                        campaign = await session.get(Campaign, link.campaign_id)
+                        if campaign and campaign.enabled:
+                            pause_campaign(campaign)
+                            paused_ids.append(campaign.id)
+            await session.commit()
+        if scheduler:
+            for cid in set(paused_ids):
+                scheduler.cancel(cid)
+
     async def wizard_next_topic(call: CallbackQuery, state: FSMContext) -> None:
         data = await state.get_data()
         selected = data.get("topic_selections", {})
@@ -337,6 +375,7 @@ def build_router(
     ) -> None:
         data = await state.get_data()
         sender_id = data["sender_id"]
+        await refresh_registered_forums(sender_id)
         await state.update_data(interval_seconds=seconds, target_ids=[])
         await state.set_state(CampaignWizard.targets)
         async with sessions() as session:
@@ -853,6 +892,13 @@ def build_router(
     async def campaign_targets(call: CallbackQuery) -> None:
         cid = int(call.data.rsplit(":", 1)[1])
         async with sessions() as session:
+            current = await session.get(Campaign, cid)
+            if not current:
+                await call.answer("کمپین حذف شده است.", show_alert=True)
+                return
+            sender_id = current.sender_account_id
+        await refresh_registered_forums(sender_id)
+        async with sessions() as session:
             campaign = await session.scalar(
                 select(Campaign).where(Campaign.id == cid).options(selectinload(Campaign.targets))
             )
@@ -1230,36 +1276,7 @@ def build_router(
             except (PermissionError, OSError, RPCError):
                 await call.answer("دریافت گفتگوها ناموفق بود", show_alert=True)
                 return
-            # Refresh already registered groups without requiring another registration.
-            # Pause campaigns if a legacy target turned out to be a Forum with no topic.
-            paused_for_forum = []
-            async with sessions() as session:
-                registered = list((await session.scalars(
-                    select(TargetChat).where(TargetChat.sender_account_id == aid_i)
-                )).all())
-                found_by_id = {x.telegram_chat_id: x for x in found}
-                for group in registered:
-                    actual = found_by_id.get(group.telegram_chat_id)
-                    if actual is None:
-                        continue
-                    if group.is_forum != actual.is_forum:
-                        group.is_forum = actual.is_forum
-                        if actual.is_forum:
-                            links = list((await session.scalars(
-                                select(CampaignTarget).where(
-                                    CampaignTarget.target_chat_id == group.id,
-                                    CampaignTarget.topic_id.is_(None),
-                                )
-                            )).all())
-                            for link in links:
-                                campaign = await session.get(Campaign, link.campaign_id)
-                                if campaign.enabled:
-                                    pause_campaign(campaign)
-                                    paused_for_forum.append(campaign.id)
-                await session.commit()
-            if scheduler:
-                for cid in set(paused_for_forum):
-                    scheduler.cancel(cid)
+            await refresh_registered_forums(aid_i, found)
             dialogs = [
                 x.__dict__
                 if hasattr(x, "__dict__")
@@ -1484,6 +1501,10 @@ def build_router(
         async with sessions() as session:
             target = await session.get(TargetChat, tid)
         await state.update_data(test_target_id=tid, test_topic_id=None)
+        if target:
+            await refresh_registered_forums(target.sender_account_id)
+            async with sessions() as session:
+                target = await session.get(TargetChat, tid)
         if not target or not target.enabled:
             await call.answer("گروه غیرفعال یا حذف شده است.", show_alert=True)
             return
