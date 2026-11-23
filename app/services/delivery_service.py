@@ -230,7 +230,7 @@ class DeliveryService:
             else:
                 campaign.delivery_cursor = 0
             await self._finish(session, campaign, token, failed=had_failure, manual=manual)
-            return True
+            return not had_failure
 
     async def _finish(self, session, campaign, token: str, *, failed: bool, manual: bool) -> None:
         now = datetime.now(UTC)
