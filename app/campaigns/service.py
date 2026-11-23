@@ -24,11 +24,15 @@ async def validate_campaign_ready(session: AsyncSession, campaign: Campaign) -> 
     if enabled_message is None:
         raise CampaignValidationError("کمپین حداقل به یک پیام فعال نیاز دارد.")
     await session.refresh(campaign, ["targets"])
-    if not any(
-        target.enabled and target.sender_account_id == campaign.sender_account_id
-        for target in campaign.targets
-    ):
+    from app.campaigns.per_target import active_links
+
+    links = await active_links(session, campaign)
+    if not links:
         raise CampaignValidationError("کمپین حداقل به یک گروه مقصد فعال نیاز دارد.")
+    if any(chat.is_forum and link.topic_id is None for link, chat in links):
+        raise CampaignValidationError(
+            "برای همه گروه‌های تاپیک‌دار باید تاپیک مقصد انتخاب شود."
+        )
 
 
 async def activate_campaign(
