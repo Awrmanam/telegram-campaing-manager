@@ -51,6 +51,7 @@ class TargetChat(Base):
     title: Mapped[str] = mapped_column(String(250))
     username: Mapped[str | None] = mapped_column(String(80))
     chat_type: Mapped[str] = mapped_column(String(30))
+    is_forum: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -88,6 +89,8 @@ class Campaign(Base):
 class CampaignTarget(Base):
     __tablename__ = "campaign_targets"
     interval_seconds: Mapped[int | None] = mapped_column(nullable=True)
+    topic_id: Mapped[int | None] = mapped_column(nullable=True)
+    topic_title: Mapped[str | None] = mapped_column(String(250), nullable=True)
     next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     campaign_id: Mapped[int] = mapped_column(
         ForeignKey("campaigns.id", ondelete="CASCADE"), primary_key=True
@@ -135,6 +138,7 @@ class DeliveryLog(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[DeliveryStatus] = mapped_column(Enum(DeliveryStatus), index=True)
     telegram_message_id: Mapped[int | None]
+    topic_id: Mapped[int | None] = mapped_column(nullable=True)
     error_type: Mapped[str | None] = mapped_column(String(120))
     error_message: Mapped[str | None] = mapped_column(Text)
 

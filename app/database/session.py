@@ -30,7 +30,11 @@ async def initialize_database(engine: AsyncEngine) -> None:
         # does not add columns to existing tables; preserve DB and sessions.
         if engine.url.get_backend_name() == "sqlite":
             upgrades = {
+                "target_chats": {"is_forum": "BOOLEAN DEFAULT 0 NOT NULL"},
+                "delivery_logs": {"topic_id": "INTEGER"},
                 "campaign_targets": {
+                    "topic_id": "INTEGER",
+                    "topic_title": "VARCHAR(250)",
                     "interval_seconds": "INTEGER",
                     "next_run_at": "DATETIME",
                 },

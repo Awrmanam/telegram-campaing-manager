@@ -10,6 +10,7 @@ class AccessibleChat:
     title: str
     username: str | None
     chat_type: str
+    is_forum: bool = False
 
 
 class ChatService:
@@ -28,6 +29,7 @@ class ChatService:
                         dialog.name or "بدون نام",
                         getattr(entity, "username", None),
                         "channel" if getattr(entity, "broadcast", False) else "group",
+                        bool(getattr(entity, "forum", False)),
                     )
                 )
         return result

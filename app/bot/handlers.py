@@ -41,6 +41,7 @@ from app.database.models import (
     TargetChat,
 )
 from app.services.media_service import remove_managed_media, replace_message_content
+from app.telegram.topics import list_forum_topics, select_forum_topic
 from app.telegram.transport import forward_original, resolve_peer
 
 logger = logging.getLogger(__name__)
@@ -152,6 +153,98 @@ def build_router(
                     )
                 ).all()
             )
+
+    def topic_keyboard(topics: list[dict], page: int, prefix: str, back="cancel"):
+        page = max(0, page)
+        choices = topics[page * 8 : page * 8 + 8]
+        rows = [(f"🧵 {topic['title'][:48]}", f"{prefix}:pick:{topic['id']}")
+                for topic in choices]
+        if page:
+            rows.append(("⬅️ قبلی", f"{prefix}:page:{page - 1}"))
+        if (page + 1) * 8 < len(topics):
+            rows.append(("بعدی ➡️", f"{prefix}:page:{page + 1}"))
+        return rows_keyboard(rows, back=back)
+
+    async def fetch_target_topics(target: TargetChat) -> list[dict]:
+        async with sessions() as session:
+            account = await session.get(SenderAccount, target.sender_account_id)
+        if not account or not account.enabled or not target.is_forum:
+            raise ValueError("گروه انتخاب‌شده Forum نیست یا اکانت فعال نیست.")
+        client = await chat_service.clients.get(account)
+        found = await list_forum_topics(client, target.telegram_chat_id)
+        return [{"id": topic.id, "title": topic.title} for topic in found]
+
+    async def refresh_registered_forums(sender_id: int, found=None) -> None:
+        """Refresh Forum flags for older group registrations without adding any groups."""
+        if chat_service is None:
+            return
+        if found is None:
+            async with sessions() as session:
+                account = await session.get(SenderAccount, sender_id)
+            if account is None or not account.enabled:
+                return
+            found = await chat_service.list_accessible(account)
+        actual_by_id = {item.telegram_chat_id: item for item in found}
+        paused_ids = []
+        async with sessions() as session:
+            registered = list((await session.scalars(
+                select(TargetChat).where(TargetChat.sender_account_id == sender_id)
+            )).all())
+            for target in registered:
+                actual = actual_by_id.get(target.telegram_chat_id)
+                if actual is None or target.is_forum == actual.is_forum:
+                    continue
+                target.is_forum = actual.is_forum
+                if actual.is_forum:
+                    links = list((await session.scalars(
+                        select(CampaignTarget).where(
+                            CampaignTarget.target_chat_id == target.id,
+                            CampaignTarget.topic_id.is_(None),
+                        )
+                    )).all())
+                    for link in links:
+                        campaign = await session.get(Campaign, link.campaign_id)
+                        if campaign and campaign.enabled:
+                            pause_campaign(campaign)
+                            paused_ids.append(campaign.id)
+            await session.commit()
+        if scheduler:
+            for cid in set(paused_ids):
+                scheduler.cancel(cid)
+
+    async def wizard_next_topic(call: CallbackQuery, state: FSMContext) -> None:
+        data = await state.get_data()
+        selected = data.get("topic_selections", {})
+        remaining = [
+            tid for tid in data.get("pending_topic_targets", [])
+            if str(tid) not in selected
+        ]
+        if not remaining:
+            await state.set_state(CampaignWizard.message)
+            await call.message.edit_text(
+                "✅ تاپیک‌ها تعیین شدند.\n"
+                "پیام کمپین را بفرستید: متن، تصویر، فوروارد یا لینک پست."
+            )
+            await call.answer()
+            return
+        tid = remaining[0]
+        async with sessions() as session:
+            target = await session.get(TargetChat, tid)
+        if not target or not target.is_forum:
+            await call.answer("گروه Forum دیگر در دسترس نیست.", show_alert=True)
+            return
+        topics = await fetch_target_topics(target)
+        if not topics:
+            await call.answer("این گروه تاپیک باز و قابل دسترس ندارد.", show_alert=True)
+            return
+        await state.set_state(CampaignWizard.topic)
+        await state.update_data(current_topic_target=tid, topic_options=topics)
+        await call.message.edit_text(
+            f"🧵 گروه «{target.title}» تاپیک دارد.\n"
+            "تاپیک مقصد این کمپین را مشخص کنید:",
+            reply_markup=topic_keyboard(topics, 0, "wiz:topic"),
+        )
+        await call.answer()
 
     async def show_campaign(call: CallbackQuery, campaign_id: int) -> None:
         async with sessions() as session:
@@ -282,6 +375,7 @@ def build_router(
     ) -> None:
         data = await state.get_data()
         sender_id = data["sender_id"]
+        await refresh_registered_forums(sender_id)
         await state.update_data(interval_seconds=seconds, target_ids=[])
         await state.set_state(CampaignWizard.targets)
         async with sessions() as session:
@@ -297,7 +391,7 @@ def build_router(
                 ).all()
             )
         kb = rows_keyboard(
-            [(f"⬜ {x.title}", f"wiz:target:{x.id}") for x in targets]
+            [(f"⬜ {'🧵 ' if x.is_forum else ''}{x.title}", f"wiz:target:{x.id}") for x in targets]
             + [("✅ ادامه", "wiz:targets_done")],
             back="cancel",
         )
@@ -324,8 +418,53 @@ def build_router(
         if not data.get("target_ids"):
             await call.answer("حداقل یک گروه انتخاب کنید", show_alert=True)
             return
-        await state.set_state(CampaignWizard.message)
-        await call.message.edit_text("پیام اول: متن، عکس، فوروارد پست کانال یا لینک مستقیم پست (آلبوم کامل فوروارد می‌شود):")
+        async with sessions() as session:
+            groups = list((await session.scalars(
+                select(TargetChat).where(
+                    TargetChat.id.in_(data["target_ids"]),
+                    TargetChat.sender_account_id == data["sender_id"],
+                    TargetChat.enabled.is_(True),
+                )
+            )).all())
+        if len(groups) != len(data["target_ids"]):
+            await call.answer("یکی از گروه‌ها دیگر مجاز یا فعال نیست.", show_alert=True)
+            return
+        await state.update_data(
+            pending_topic_targets=[g.id for g in groups if g.is_forum],
+            topic_selections={},
+        )
+        await wizard_next_topic(call, state)
+
+    @router.callback_query(CampaignWizard.topic, F.data.startswith("wiz:topic:page:"))
+    async def wizard_topic_page(call: CallbackQuery, state: FSMContext) -> None:
+        data = await state.get_data()
+        page = int(call.data.rsplit(":", 1)[1])
+        await call.message.edit_reply_markup(
+            reply_markup=topic_keyboard(data["topic_options"], page, "wiz:topic")
+        )
+        await call.answer()
+
+    @router.callback_query(CampaignWizard.topic, F.data.startswith("wiz:topic:pick:"))
+    async def wizard_topic_pick(call: CallbackQuery, state: FSMContext) -> None:
+        data = await state.get_data()
+        topic_id = int(call.data.rsplit(":", 1)[1])
+        options = data.get("topic_options", [])
+        topic = next((x for x in options if x["id"] == topic_id), None)
+        if not topic:
+            await call.answer("تاپیک معتبر نیست.", show_alert=True)
+            return
+        tid = data["current_topic_target"]
+        async with sessions() as session:
+            target = await session.get(TargetChat, tid)
+        # Recheck topic right before saving, not just when displaying cached buttons.
+        live = await fetch_target_topics(target)
+        if not any(x["id"] == topic_id for x in live):
+            await call.answer("تاپیک دیگر قابل انتخاب نیست.", show_alert=True)
+            return
+        selected = dict(data.get("topic_selections", {}))
+        selected[str(tid)] = {"id": topic_id, "title": topic["title"]}
+        await state.update_data(topic_selections=selected)
+        await wizard_next_topic(call, state)
 
     @router.message(CampaignWizard.message)
     async def wizard_message(message: Message, state: FSMContext) -> None:
@@ -372,6 +511,19 @@ def build_router(
             )
             session.add(campaign)
             await session.flush()
+            selections = data.get("topic_selections", {})
+            for target in targets:
+                if target.is_forum:
+                    chosen = selections.get(str(target.id))
+                    if not chosen:
+                        raise ValueError("برای همه گروه‌های تاپیک‌دار باید تاپیک مقصد انتخاب شود.")
+                    link = await session.get(
+                        CampaignTarget, {
+                            "campaign_id": campaign.id, "target_chat_id": target.id
+                        }
+                    )
+                    link.topic_id = chosen["id"]
+                    link.topic_title = chosen["title"]
             media_path = None
             if item["message_type"] == "PHOTO":
                 media_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -740,6 +892,13 @@ def build_router(
     async def campaign_targets(call: CallbackQuery) -> None:
         cid = int(call.data.rsplit(":", 1)[1])
         async with sessions() as session:
+            current = await session.get(Campaign, cid)
+            if not current:
+                await call.answer("کمپین حذف شده است.", show_alert=True)
+                return
+            sender_id = current.sender_account_id
+        await refresh_registered_forums(sender_id)
+        async with sessions() as session:
             campaign = await session.scalar(
                 select(Campaign).where(Campaign.id == cid).options(selectinload(Campaign.targets))
             )
@@ -760,6 +919,11 @@ def build_router(
                 f"ct:toggle:{cid}:{chat.id}",
             ))
             if chat.id in selected:
+                if chat.is_forum:
+                    rows.append((
+                        f"🧵 مقصد {chat.title}: {selected[chat.id].topic_title or '⚠️ انتخاب نشده'}",
+                        f"ct:topic:{cid}:{chat.id}:0",
+                    ))
                 interval = selected[chat.id].interval_seconds or campaign.interval_seconds
                 rows.append((
                     f"⏱ {chat.title}: {_interval(interval)}",
@@ -768,6 +932,97 @@ def build_router(
         await call.message.edit_text(
             "گروه‌های کمپین را فعال/حذف کنید؛ فاصله هر گروه مستقل قابل تغییر است:",
             reply_markup=rows_keyboard(rows, back=f"camp:view:{cid}"),
+        )
+
+    @router.callback_query(F.data.startswith("ct:topic:"))
+    async def campaign_topic_chooser(call: CallbackQuery) -> None:
+        _, _, cid, tid, page = call.data.split(":")
+        async with sessions() as session:
+            link = await session.get(
+                CampaignTarget, {"campaign_id": int(cid), "target_chat_id": int(tid)}
+            )
+            target = await session.get(TargetChat, int(tid))
+        if not link or not target or not target.enabled or not target.is_forum:
+            await call.answer("گروه Forum به این کمپین متصل نیست.", show_alert=True)
+            return
+        topics = await fetch_target_topics(target)
+        if not topics:
+            await call.answer("تاپیک قابل انتخابی پیدا نشد.", show_alert=True)
+            return
+        current = max(0, int(page))
+        rows = [
+            (f"{'✅' if t['id'] == link.topic_id else '🧵'} {t['title'][:48]}",
+             f"ct:settopic:{cid}:{tid}:{t['id']}")
+            for t in topics[current * 8:(current + 1) * 8]
+        ]
+        if current:
+            rows.append(("⬅️ قبلی", f"ct:topic:{cid}:{tid}:{current - 1}"))
+        if (current + 1) * 8 < len(topics):
+            rows.append(("بعدی ➡️", f"ct:topic:{cid}:{tid}:{current + 1}"))
+        await call.message.edit_text(
+            f"🧵 گروه «{target.title}»: تاپیک مقصد را انتخاب کن.\n"
+            f"تاپیک کنونی: {link.topic_title or 'انتخاب نشده'}",
+            reply_markup=rows_keyboard(rows, back=f"ct:list:{cid}"),
+        )
+        await call.answer()
+
+    @router.callback_query(F.data.startswith("ct:settopic:"))
+    async def campaign_topic_save(call: CallbackQuery) -> None:
+        _, _, cid, tid, topic_id = call.data.split(":")
+        cid, tid, topic_id = int(cid), int(tid), int(topic_id)
+        async with sessions() as session:
+            campaign = await session.get(Campaign, cid)
+            link = await session.get(
+                CampaignTarget, {"campaign_id": cid, "target_chat_id": tid}
+            )
+            target = await session.get(TargetChat, tid)
+            if not campaign or not link or not target or not target.is_forum \
+                    or not target.enabled or campaign.sender_account_id != target.sender_account_id:
+                await call.answer("کمپین یا گروه معتبر نیست.", show_alert=True)
+                return
+        async with sessions() as session:
+            account = await session.get(SenderAccount, target.sender_account_id)
+        client = await chat_service.clients.get(account)
+        choice = await select_forum_topic(client, target.telegram_chat_id, topic_id)
+        async with sessions() as session:
+            campaign = await session.get(Campaign, cid)
+            link = await session.get(
+                CampaignTarget, {"campaign_id": cid, "target_chat_id": tid}
+            )
+            if not link or not campaign:
+                await call.answer("گروه از کمپین حذف شده است.", show_alert=True)
+                return
+            link.topic_id, link.topic_title = choice.id, choice.title
+            if campaign.enabled:
+                link.next_run_at = datetime.now(UTC) + timedelta(
+                    seconds=link.interval_seconds or campaign.interval_seconds
+                )
+                await sync_next_run(session, campaign)
+            await session.commit()
+        if campaign.enabled and campaign.next_run_at and scheduler:
+            scheduler.schedule(cid, campaign.next_run_at)
+        await call.message.edit_text(
+            f"✅ تاپیک «{choice.title}» به‌عنوان مقصد گروه ثبت شد.",
+            reply_markup=rows_keyboard([], back=f"ct:list:{cid}"),
+        )
+        await call.answer()
+
+    async def campaign_topic_chooser_from_add(
+        call: CallbackQuery, cid: int, tid: int
+    ) -> None:
+        async with sessions() as session:
+            target = await session.get(TargetChat, tid)
+        topics = await fetch_target_topics(target)
+        rows = [
+            (f"🧵 {topic['title'][:48]}", f"ct:settopic:{cid}:{tid}:{topic['id']}")
+            for topic in topics[:8]
+        ]
+        if len(topics) > 8:
+            rows.append(("بعدی ➡️", f"ct:topic:{cid}:{tid}:1"))
+        await call.message.edit_text(
+            f"🧵 گروه «{target.title}» تاپیک‌دار است؛ "
+            "تاپیک مقصد این کمپین را مشخص کن:",
+            reply_markup=rows_keyboard(rows, back=f"ct:list:{cid}"),
         )
 
     @router.callback_query(F.data.startswith("ct:interval:"))
@@ -857,7 +1112,10 @@ def build_router(
             "آخرین گروه حذف و کمپین متوقف شد." if paused else "ذخیره شد",
             show_alert=paused,
         )
-        await campaign_targets(call)
+        if not row and target.is_forum:
+            await campaign_topic_chooser_from_add(call, int(cid), int(tid))
+        else:
+            await campaign_targets(call)
 
     # Account management
     @router.message(F.text == "👤 حساب‌های ارسال")
@@ -1017,6 +1275,7 @@ def build_router(
             except (PermissionError, OSError, RPCError):
                 await call.answer("دریافت گفتگوها ناموفق بود", show_alert=True)
                 return
+            await refresh_registered_forums(aid_i, found)
             dialogs = [
                 x.__dict__
                 if hasattr(x, "__dict__")
@@ -1025,13 +1284,14 @@ def build_router(
                     "title": x.title,
                     "username": x.username,
                     "chat_type": x.chat_type,
+                    "is_forum": x.is_forum,
                 }
                 for x in found
             ]
             await state.update_data({f"dialogs_{aid}": dialogs})
         page_rows = dialogs[page_i * 8 : (page_i + 1) * 8]
         buttons = [
-            (x["title"], f"groups:register:{aid}:{page}:{i + page_i * 8}")
+            (("🧵 " if x.get("is_forum") else "") + x["title"], f"groups:register:{aid}:{page}:{i + page_i * 8}")
             for i, x in enumerate(page_rows)
         ]
         if page_i:
@@ -1067,6 +1327,7 @@ def build_router(
             )
             if existing:
                 existing.enabled = True
+                existing.is_forum = bool(item.get("is_forum", False))
                 existing.last_verified_at = datetime.now(UTC)
             else:
                 session.add(
@@ -1076,12 +1337,15 @@ def build_router(
                         title=item["title"],
                         username=item["username"],
                         chat_type=item["chat_type"],
+                        is_forum=bool(item.get("is_forum", False)),
                         enabled=True,
                         last_verified_at=datetime.now(UTC),
                     )
                 )
             await session.commit()
-        await call.message.edit_text("✅ گروه صریحاً در allowlist ثبت شد.")
+        await call.message.edit_text(
+            "✅ گروه ثبت شد." + (" 🧵 این گروه تاپیک دارد؛ موقع انتخاب مقصد، فهرست تاپیک‌ها نمایش داده می‌شود." if item.get("is_forum") else "")
+        )
 
     @router.callback_query(F.data.startswith("target:view:"))
     async def target_view(call: CallbackQuery) -> None:
@@ -1092,9 +1356,37 @@ def build_router(
             f"{target.title}\n<code>{target.telegram_chat_id}</code>",
             parse_mode="HTML",
             reply_markup=rows_keyboard(
-                [("فعال/غیرفعال", f"target:toggle:{tid}"), ("لغو ثبت", f"target:delask:{tid}")]
+                ([("🧵 فهرست تاپیک‌ها", f"groups:topics:{tid}:0")] if target.is_forum else [])
+                + [("فعال/غیرفعال", f"target:toggle:{tid}"), ("لغو ثبت", f"target:delask:{tid}")]
             ),
         )
+
+    @router.callback_query(F.data.startswith("groups:topics:"))
+    async def groups_topic_list(call: CallbackQuery) -> None:
+        _, _, tid, page = call.data.split(":")
+        async with sessions() as session:
+            target = await session.get(TargetChat, int(tid))
+        topics = await fetch_target_topics(target)
+        current = int(page)
+        if not topics:
+            await call.answer("تاپیک باز و قابل‌انتخابی پیدا نشد.", show_alert=True)
+            return
+        rows = [(f"🧵 {t['title'][:48]}", "noop:topic")
+                for t in topics[current * 8:(current + 1) * 8]]
+        if current:
+            rows.append(("⬅️ قبلی", f"groups:topics:{tid}:{current - 1}"))
+        if (current + 1) * 8 < len(topics):
+            rows.append(("بعدی ➡️", f"groups:topics:{tid}:{current + 1}"))
+        await call.message.edit_text(
+            f"🧵 تاپیک‌های باز گروه «{target.title}».\n"
+            "برای انتخاب مقصد، از بخش ارسال آزمایشی یا گروه‌های کمپین استفاده کن.",
+            reply_markup=rows_keyboard(rows, back=f"target:view:{tid}"),
+        )
+        await call.answer()
+
+    @router.callback_query(F.data == "noop:topic")
+    async def no_op_topic(call: CallbackQuery) -> None:
+        await call.answer("تاپیک را هنگام ساخت کمپین یا ارسال آزمایشی انتخاب کنید.")
 
     @router.callback_query(F.data.startswith("target:toggle:"))
     async def target_toggle(call: CallbackQuery) -> None:
@@ -1204,9 +1496,62 @@ def build_router(
 
     @router.callback_query(F.data.startswith("test:target:"))
     async def test_target(call: CallbackQuery, state: FSMContext) -> None:
-        await state.update_data(test_target_id=int(call.data.rsplit(":", 1)[1]))
+        tid = int(call.data.rsplit(":", 1)[1])
+        async with sessions() as session:
+            target = await session.get(TargetChat, tid)
+        await state.update_data(test_target_id=tid, test_topic_id=None)
+        if target:
+            await refresh_registered_forums(target.sender_account_id)
+            async with sessions() as session:
+                target = await session.get(TargetChat, tid)
+        if not target or not target.enabled:
+            await call.answer("گروه غیرفعال یا حذف شده است.", show_alert=True)
+            return
+        if target.is_forum:
+            topics = await fetch_target_topics(target)
+            if not topics:
+                await call.answer("تاپیک باز و قابل دسترسی پیدا نشد.", show_alert=True)
+                return
+            await state.update_data(test_topic_options=topics)
+            await state.set_state(TextInput.test_topic)
+            await call.message.edit_text(
+                f"🧵 گروه «{target.title}» تاپیک‌دار است؛ تاپیک ارسال آزمایشی را انتخاب کن:",
+                reply_markup=topic_keyboard(topics, 0, "test:topic"),
+            )
+        else:
+            await state.set_state(TextInput.test_message)
+            await call.message.edit_text(
+                "پیام آزمایشی: متن، تصویر، فوروارد کانال یا لینک مستقیم پست:"
+            )
+        await call.answer()
+
+    @router.callback_query(TextInput.test_topic, F.data.startswith("test:topic:page:"))
+    async def test_topic_page(call: CallbackQuery, state: FSMContext) -> None:
+        page = int(call.data.rsplit(":", 1)[1])
+        data = await state.get_data()
+        await call.message.edit_reply_markup(
+            reply_markup=topic_keyboard(data["test_topic_options"], page, "test:topic")
+        )
+        await call.answer()
+
+    @router.callback_query(TextInput.test_topic, F.data.startswith("test:topic:pick:"))
+    async def test_topic_pick(call: CallbackQuery, state: FSMContext) -> None:
+        tid = int(call.data.rsplit(":", 1)[1])
+        data = await state.get_data()
+        async with sessions() as session:
+            target = await session.get(TargetChat, data["test_target_id"])
+        live = await fetch_target_topics(target)
+        topic = next((x for x in live if x["id"] == tid), None)
+        if not topic:
+            await call.answer("تاپیک حذف یا بسته شده است.", show_alert=True)
+            return
+        await state.update_data(test_topic_id=tid, test_topic_title=topic["title"])
         await state.set_state(TextInput.test_message)
-        await call.message.edit_text("پیام آزمایشی: متن، تصویر، فوروارد کانال یا لینک مستقیم پست:")
+        await call.message.edit_text(
+            f"✅ تاپیک مقصد: {topic['title']}\n"
+            "پیام آزمایشی (متن، عکس، فوروارد یا لینک پست) را ارسال کن:"
+        )
+        await call.answer()
 
     @router.message(TextInput.test_message)
     async def test_preview(message: Message, state: FSMContext) -> None:
@@ -1247,11 +1592,18 @@ def build_router(
                     return
                 client = await chat_service.clients.get(account)
                 item = data["test_item"]
+                topic_id = data.get("test_topic_id")
+                if target.is_forum and topic_id is None:
+                    raise ValueError("برای ارسال به گروه Forum باید تاپیک انتخاب شود.")
+                if not target.is_forum and topic_id is not None:
+                    raise ValueError("این گروه تاپیک ندارد.")
                 peer = await resolve_peer(client, target.telegram_chat_id)
+                reply_to = topic_id if topic_id and topic_id != 1 else None
                 if item["message_type"] == "FORWARD":
                     await forward_original(
                         client, target.telegram_chat_id,
                         item["forward_chat_ref"], item["forward_message_id"],
+                        topic_id=topic_id,
                     )
                 elif item["message_type"] == "PHOTO":
                     media_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1260,11 +1612,14 @@ def build_router(
                         await call.bot.download(item["file_id"], destination=temporary)
                         await client.send_file(
                             peer, str(temporary), caption=item["text"], parse_mode=None,
+                            reply_to=reply_to,
                         )
                     finally:
                         temporary.unlink(missing_ok=True)
                 else:
-                    await client.send_message(peer, item["text"], parse_mode=None)
+                    await client.send_message(
+                        peer, item["text"], parse_mode=None, reply_to=reply_to
+                    )
         except Exception as exc:
             logger.exception("test_delivery_failed")
             await call.message.answer(
@@ -1275,7 +1630,11 @@ def build_router(
             return
         await state.clear()
         await call.message.edit_reply_markup()
-        await call.message.answer("✅ ارسال آزمایشی موفق بود؛ زمان‌بندی تغییر نکرد.")
+        await call.message.answer(
+            "✅ ارسال آزمایشی موفق بود"
+            + (f"؛ تاپیک: {data.get('test_topic_title')}" if data.get("test_topic_id") else "")
+            + ". زمان‌بندی تغییر نکرد."
+        )
 
     @router.callback_query(F.data == "test:send")
     async def expired_test_confirmation(call: CallbackQuery) -> None:

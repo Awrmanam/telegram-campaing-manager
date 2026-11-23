@@ -1,7 +1,13 @@
 """MTProto entity resolution and native forwarding of source posts/albums."""
 from __future__ import annotations
 
+import logging
+from secrets import randbits
+
+from telethon import functions, types
 from telethon.errors import RPCError
+
+logger = logging.getLogger(__name__)
 
 
 async def resolve_peer(client, reference: str | int):
@@ -29,7 +35,8 @@ async def resolve_peer(client, reference: str | int):
 
 
 async def forward_original(
-    client, destination: str | int, source: str | int, message_id: int
+    client, destination: str | int, source: str | int, message_id: int,
+    *, topic_id: int | None = None,
 ) -> int:
     """Forward an entire Telegram source album when the selected post is grouped.
 
@@ -52,6 +59,46 @@ async def forward_original(
         )
         if not ids:
             ids = [original.id]
+    if topic_id is not None and topic_id != 1:
+        # Telethon's convenience forward_messages does not accept a forum topic.
+        # Use the official MTProto top_msg_id, then verify actual destinations:
+        # some Telegram servers route forwards into General despite top_msg_id.
+        updates = await client(
+            functions.messages.ForwardMessagesRequest(
+                from_peer=src_peer,
+                id=ids,
+                random_id=[randbits(63) for _ in ids],
+                to_peer=dest_peer,
+                top_msg_id=topic_id,
+            )
+        )
+        sent_ids = [
+            update.id for update in getattr(updates, "updates", [])
+            if isinstance(update, types.UpdateMessageID)
+        ]
+        if not sent_ids:
+            raise ValueError("فوروارد ثبت شد ولی شناسه پیام ارسالی برای بررسی تاپیک دریافت نشد.")
+        received = await client.get_messages(dest_peer, ids=sent_ids)
+        received = received if isinstance(received, list) else [received]
+        correct = len(received) == len(sent_ids) and all(
+            msg and getattr(msg, "reply_to", None)
+            and (
+                getattr(msg.reply_to, "reply_to_top_id", None) == topic_id
+                or getattr(msg.reply_to, "reply_to_msg_id", None) == topic_id
+            )
+            for msg in received
+        )
+        if not correct:
+            # Fail closed: don't leave a silently misrouted post in General.
+            try:
+                await client.delete_messages(dest_peer, sent_ids)
+            except (RPCError, OSError, ValueError):
+                logger.exception("failed_to_delete_wrong_topic_forward")
+            raise ValueError(
+                "تلگرام فوروارد را به تاپیک انتخابی هدایت نکرد؛ "
+                "ارسال تأیید نشد. تاپیک را بررسی کنید."
+            )
+        return sent_ids[0]
     sent = await client.forward_messages(dest_peer, ids, from_peer=src_peer)
     if not sent:
         raise ValueError("تلگرام فوروارد را انجام نداد.")

@@ -7,6 +7,7 @@ class CampaignWizard(StatesGroup):
     interval = State()
     custom_interval = State()
     targets = State()
+    topic = State()
     message = State()
     preview = State()
 
@@ -18,4 +19,5 @@ class TextInput(StatesGroup):
     message_add = State()
     message_edit = State()
     test_message = State()
+    test_topic = State()
     test_preview = State()
