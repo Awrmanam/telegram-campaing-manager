@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import logging
 import re
 from pathlib import Path
@@ -513,11 +513,22 @@ def build_router(
         data = await state.get_data()
         async with sessions() as session:
             campaign = await session.get(Campaign, data["campaign_id"])
+            previous = campaign.interval_seconds
             campaign.interval_seconds = seconds
+            # Changing the campaign default only updates targets still using
+            # that default; custom per-group intervals remain untouched.
+            links = list((await session.scalars(
+                select(CampaignTarget).where(CampaignTarget.campaign_id == campaign.id)
+            )).all())
+            for link in links:
+                if link.interval_seconds is None or link.interval_seconds == previous:
+                    link.interval_seconds = seconds
+                    if campaign.enabled:
+                        link.next_run_at = datetime.now(UTC) + timedelta(seconds=seconds)
             if campaign.enabled:
-                campaign.next_run_at = calculate_next_run(datetime.now(UTC), seconds)
+                await sync_next_run(session, campaign)
             await session.commit()
-        if campaign.enabled and scheduler:
+        if campaign.enabled and campaign.next_run_at and scheduler:
             scheduler.schedule(campaign.id, campaign.next_run_at)
         await state.clear()
         await message.answer("✅ فاصله تغییر کرد.")
@@ -733,24 +744,78 @@ def build_router(
             campaign = await session.scalar(
                 select(Campaign).where(Campaign.id == cid).options(selectinload(Campaign.targets))
             )
-            all_targets = list(
-                (
-                    await session.scalars(
-                        select(TargetChat).where(
-                            TargetChat.sender_account_id == campaign.sender_account_id,
-                            TargetChat.enabled.is_(True),
-                        )
-                    )
-                ).all()
-            )
-        selected = {x.id for x in campaign.targets}
-        rows = [
-            (f"{'✅' if x.id in selected else '⬜'} {x.title}", f"ct:toggle:{cid}:{x.id}")
-            for x in all_targets
-        ]
+            all_targets = list((await session.scalars(
+                select(TargetChat).where(
+                    TargetChat.sender_account_id == campaign.sender_account_id,
+                    TargetChat.enabled.is_(True),
+                )
+            )).all())
+            links = list((await session.scalars(
+                select(CampaignTarget).where(CampaignTarget.campaign_id == cid)
+            )).all())
+        selected = {link.target_chat_id: link for link in links}
+        rows = []
+        for chat in all_targets:
+            rows.append((
+                f"{'✅' if chat.id in selected else '⬜'} {chat.title}",
+                f"ct:toggle:{cid}:{chat.id}",
+            ))
+            if chat.id in selected:
+                interval = selected[chat.id].interval_seconds or campaign.interval_seconds
+                rows.append((
+                    f"⏱ {chat.title}: {_interval(interval)}",
+                    f"ct:interval:{cid}:{chat.id}",
+                ))
         await call.message.edit_text(
-            "گروه‌ها را اضافه/حذف کنید:", reply_markup=rows_keyboard(rows, back=f"camp:view:{cid}")
+            "گروه‌های کمپین را فعال/حذف کنید؛ فاصله هر گروه مستقل قابل تغییر است:",
+            reply_markup=rows_keyboard(rows, back=f"camp:view:{cid}"),
         )
+
+    @router.callback_query(F.data.startswith("ct:interval:"))
+    async def target_interval_prompt(call: CallbackQuery, state: FSMContext) -> None:
+        _, _, cid, tid = call.data.split(":")
+        async with sessions() as session:
+            link = await session.get(
+                CampaignTarget, {"campaign_id": int(cid), "target_chat_id": int(tid)}
+            )
+            if not link:
+                await call.answer("این گروه در کمپین ثبت نشده.", show_alert=True)
+                return
+        await state.set_state(TextInput.target_interval)
+        await state.update_data(interval_campaign=int(cid), interval_target=int(tid))
+        await call.message.answer(
+            "فاصله اختصاصی این گروه را وارد کنید (مثلاً 6h یا 24h). "
+            "حداقل ۵ دقیقه و حداکثر ۳۰ روز:"
+        )
+        await call.answer()
+
+    @router.message(TextInput.target_interval)
+    async def target_interval_save(message: Message, state: FSMContext) -> None:
+        try:
+            seconds = parse_interval(message.text or "")
+        except ValueError as exc:
+            await message.answer(str(exc))
+            return
+        data = await state.get_data()
+        async with sessions() as session:
+            cid, tid = data["interval_campaign"], data["interval_target"]
+            link = await session.get(
+                CampaignTarget, {"campaign_id": cid, "target_chat_id": tid}
+            )
+            campaign = await session.get(Campaign, cid)
+            if not link or not campaign:
+                await message.answer("این گروه/کمپین دیگر وجود ندارد.")
+                await state.clear()
+                return
+            link.interval_seconds = seconds
+            link.next_run_at = datetime.now(UTC) + timedelta(seconds=seconds)
+            if campaign.enabled:
+                await sync_next_run(session, campaign)
+            await session.commit()
+        if campaign.enabled and campaign.next_run_at and scheduler:
+            scheduler.schedule(cid, campaign.next_run_at)
+        await state.clear()
+        await message.answer(f"✅ فاصله اختصاصی گروه ثبت شد: {_interval(seconds)}")
 
     @router.callback_query(F.data.startswith("ct:toggle:"))
     async def campaign_target_toggle(call: CallbackQuery) -> None:
@@ -760,8 +825,9 @@ def build_router(
                 await session.get(Campaign, int(cid)),
                 await session.get(TargetChat, int(tid)),
             )
-            if target.sender_account_id != campaign.sender_account_id:
-                await call.answer("حساب گروه ناسازگار است", show_alert=True)
+            if not campaign or not target or not target.enabled \
+                    or target.sender_account_id != campaign.sender_account_id:
+                await call.answer("حساب یا گروه مجاز نیست", show_alert=True)
                 return
             row = await session.get(
                 CampaignTarget, {"campaign_id": int(cid), "target_chat_id": int(tid)}
@@ -771,15 +837,28 @@ def build_router(
                 await session.flush()
                 paused = await pause_if_no_enabled_targets(session, campaign)
             else:
-                session.add(CampaignTarget(campaign_id=int(cid), target_chat_id=int(tid)))
+                session.add(CampaignTarget(
+                    campaign_id=int(cid), target_chat_id=int(tid),
+                    interval_seconds=campaign.interval_seconds,
+                    next_run_at=datetime.now(UTC) + timedelta(
+                        seconds=campaign.interval_seconds
+                    ),
+                ))
+                await session.flush()
                 paused = False
+            if campaign.enabled and not paused:
+                await sync_next_run(session, campaign)
             await session.commit()
-        if paused and scheduler:
-            scheduler.cancel(int(cid))
+        if scheduler:
+            if paused:
+                scheduler.cancel(int(cid))
+            elif campaign.enabled and campaign.next_run_at:
+                scheduler.schedule(int(cid), campaign.next_run_at)
         await call.answer(
-            "آخرین گروه حذف و کمپین خودکار متوقف شد." if paused else "ذخیره شد",
+            "آخرین گروه حذف و کمپین متوقف شد." if paused else "ذخیره شد",
             show_alert=paused,
         )
+        await campaign_targets(call)
 
     # Account management
     @router.message(F.text == "👤 حساب‌های ارسال")
