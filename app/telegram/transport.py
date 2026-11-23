@@ -5,7 +5,7 @@ import logging
 from secrets import randbits
 
 from telethon import functions, types
-from telethon.errors import RPCError
+from telethon.errors import PeerIdInvalidError, RPCError
 
 logger = logging.getLogger(__name__)
 
@@ -60,18 +60,40 @@ async def forward_original(
         if not ids:
             ids = [original.id]
     if topic_id is not None and topic_id != 1:
+        if topic_id <= 0:
+            raise ValueError("شناسه تاپیک معتبر نیست.")
+        # Access to the source post is confirmed above by get_messages().
+        # The MTProto forward request may still be rejected by Telegram; never
+        # silently retry without top_msg_id, which would post into General.
         # Telethon's convenience forward_messages does not accept a forum topic.
         # Use the official MTProto top_msg_id, then verify actual destinations:
         # some Telegram servers route forwards into General despite top_msg_id.
-        updates = await client(
-            functions.messages.ForwardMessagesRequest(
-                from_peer=src_peer,
-                id=ids,
-                random_id=[randbits(63) for _ in ids],
-                to_peer=dest_peer,
-                top_msg_id=topic_id,
+        try:
+            updates = await client(
+                functions.messages.ForwardMessagesRequest(
+                    from_peer=src_peer,
+                    id=ids,
+                    random_id=[randbits(63) for _ in ids],
+                    to_peer=dest_peer,
+                    top_msg_id=topic_id,
+                )
             )
-        )
+        except PeerIdInvalidError as exc:
+            logger.warning(
+                "forum_native_forward_rejected source_peer_type=%s "
+                "destination_peer_type=%s topic_id=%s message_count=%d",
+                type(src_peer).__name__,
+                type(dest_peer).__name__,
+                topic_id,
+                len(ids),
+            )
+            raise ValueError(
+                "تلگرام فوروارد مستقیم به این تاپیک را با PEER_ID_INVALID رد کرد. "
+                "خواندن پست مبدأ ممکن بود، ولی درخواست فوروارد پذیرفته نشد. "
+                "اول یک پیام متنی ساده به همین تاپیک تست کن؛ اگر ارسال شد، "
+                "مشکل از مسیر فوروارد/مبدأ است. "
+                "بدون تأیید مقصد، پیام به تاپیک عمومی فرستاده نمی‌شود."
+            ) from exc
         sent_ids = [
             update.id for update in getattr(updates, "updates", [])
             if isinstance(update, types.UpdateMessageID)
