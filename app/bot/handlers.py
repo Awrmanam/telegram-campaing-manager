@@ -921,8 +921,7 @@ def build_router(
             if chat.id in selected:
                 if chat.is_forum:
                     rows.append((
-                        f"🧵 مقصد {chat.title}: "
-                        f"{selected[chat.id].topic_title or '⚠️ انتخاب نشده'}",
+                        f"🧵 مقصد {chat.title}: {selected[chat.id].topic_title or '⚠️ انتخاب نشده'}",
                         f"ct:topic:{cid}:{chat.id}:0",
                     ))
                 interval = selected[chat.id].interval_seconds or campaign.interval_seconds
