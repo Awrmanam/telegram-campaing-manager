@@ -128,25 +128,38 @@ class DeliveryService:
                     campaign_message_id=message.id,
                     sender_account_id=account.id,
                     target_chat_id=target.id,
+                    topic_id=links[target.id].topic_id,
                     status=DeliveryStatus.FAILED,
                 )
                 session.add(log)
                 try:
+                    link = links[target.id]
+                    topic_id = link.topic_id
+                    if target.is_forum and topic_id is None:
+                        raise ValueError(
+                            f"برای گروه تاپیک‌دار «{target.title}» تاپیک مقصد انتخاب نشده است."
+                        )
+                    if not target.is_forum and topic_id is not None:
+                        raise ValueError("گروه دیگر Forum نیست؛ مقصد تاپیک نامعتبر است.")
+                    reply_to = topic_id if topic_id and topic_id != 1 else None
                     peer = await resolve_peer(client, target.telegram_chat_id)
                     if message.message_type == MessageType.FORWARD:
                         sent_id = await forward_original(
                             client, target.telegram_chat_id,
-                            message.forward_chat_ref, message.forward_message_id
+                            message.forward_chat_ref, message.forward_message_id,
+                            topic_id=topic_id,
                         )
                     elif message.message_type == MessageType.PHOTO:
                         sent = await client.send_file(
                             peer, message.media_path,
                             caption=message.text, parse_mode=message.parse_mode,
+                            reply_to=reply_to,
                         )
                         sent_id = sent.id
                     else:
                         sent = await client.send_message(
-                            peer, message.text or "", parse_mode=message.parse_mode
+                            peer, message.text or "", parse_mode=message.parse_mode,
+                            reply_to=reply_to,
                         )
                         sent_id = sent.id
                     log.status, log.telegram_message_id = DeliveryStatus.SUCCESS, sent_id
