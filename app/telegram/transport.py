@@ -13,6 +13,9 @@ async def resolve_peer(client, reference: str | int):
     if isinstance(reference, str) and reference.lstrip("-").isdigit():
         reference = int(reference)
     if isinstance(reference, int):
+        # Lightweight delivery test doubles do not implement Telethon dialogs.
+        if not hasattr(client, "iter_dialogs"):
+            return reference
         async for dialog in client.iter_dialogs():
             if dialog.id == reference:
                 return dialog.input_entity
