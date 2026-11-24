@@ -16,6 +16,7 @@ from telethon.errors import RPCError
 
 from app.bot.keyboards import confirm_keyboard, main_menu, rows_keyboard
 from app.bot.states import CampaignWizard, TextInput
+from app.campaigns.create import prepare_campaign
 from app.campaigns.per_target import sync_next_run
 from app.campaigns.service import (
     CampaignValidationError,
@@ -501,13 +502,12 @@ def build_router(
         item = data["message"]
         async with sessions() as session:
             targets = await validate_targets(session, data["sender_id"], set(data["target_ids"]))
-            campaign = Campaign(
+            campaign, first_message = prepare_campaign(
                 name=data["name"],
                 sender_account_id=data["sender_id"],
                 interval_seconds=data["interval_seconds"],
-                timezone="Asia/Tehran",
-                enabled=False,
                 targets=targets,
+                message=item,
             )
             session.add(campaign)
             await session.flush()
@@ -529,16 +529,7 @@ def build_router(
                 media_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
                 media_path = str(media_directory / f"campaign_{campaign.id}_1.jpg")
                 await call.bot.download(item["file_id"], destination=media_path)
-            campaign.messages.append(
-                CampaignMessage(
-                    position=1,
-                    message_type=MessageType(item["message_type"]),
-                    text=item["text"],
-                    media_path=media_path,
-                    forward_chat_ref=item.get("forward_chat_ref"),
-                    forward_message_id=item.get("forward_message_id"),
-                )
-            )
+            first_message.media_path = media_path
             await session.commit()
             campaign_id = campaign.id
         await state.clear()
