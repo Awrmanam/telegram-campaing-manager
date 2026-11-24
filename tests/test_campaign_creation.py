@@ -8,7 +8,6 @@ from app.campaigns.create import prepare_campaign
 from app.database.models import (
     Base,
     Campaign,
-    CampaignMessage,
     CampaignTarget,
     MessageType,
     SenderAccount,
